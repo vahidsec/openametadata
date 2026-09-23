@@ -1,0 +1,455 @@
+package org.openmetadata.service.search.elasticsearch.dataInsightAggregators;
+
+import es.co.elastic.clients.elasticsearch._types.aggregations.Aggregate;
+import es.co.elastic.clients.elasticsearch._types.aggregations.Aggregation;
+import es.co.elastic.clients.elasticsearch._types.aggregations.CardinalityAggregate;
+import es.co.elastic.clients.elasticsearch._types.aggregations.DateHistogramBucket;
+import es.co.elastic.clients.elasticsearch._types.aggregations.FilterAggregate;
+import es.co.elastic.clients.elasticsearch._types.aggregations.SingleMetricAggregateBase;
+import es.co.elastic.clients.elasticsearch._types.aggregations.StringTermsBucket;
+import es.co.elastic.clients.elasticsearch._types.query_dsl.Query;
+import es.co.elastic.clients.elasticsearch.core.SearchRequest;
+import es.co.elastic.clients.elasticsearch.core.SearchResponse;
+import es.co.elastic.clients.json.JsonData;
+import java.io.StringReader;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import org.jetbrains.annotations.NotNull;
+import org.openmetadata.schema.dataInsight.custom.DataInsightCustomChart;
+import org.openmetadata.schema.dataInsight.custom.DataInsightCustomChartResult;
+import org.openmetadata.schema.dataInsight.custom.DataInsightCustomChartResultList;
+import org.openmetadata.schema.dataInsight.custom.FormulaHolder;
+import org.openmetadata.schema.dataInsight.custom.Function;
+import org.openmetadata.service.jdbi3.DataInsightSystemChartRepository;
+import org.openmetadata.service.search.DataInsightMetricFilter;
+import org.openmetadata.service.util.DataInsightFormulaEvaluator;
+
+public interface ElasticSearchDynamicChartAggregatorInterface {
+
+  long MILLISECONDS_IN_DAY = 24L * 60 * 60 * 1000;
+
+  private static Aggregation getSubAggregationsByFunction(
+      Function function, String field, int index) {
+    return switch (function) {
+      case COUNT -> Aggregation.of(a -> a.valueCount(v -> v.field(field)));
+      case SUM -> Aggregation.of(a -> a.sum(s -> s.field(field)));
+      case AVG -> Aggregation.of(a -> a.avg(avg -> avg.field(field)));
+      case MIN -> Aggregation.of(a -> a.min(m -> m.field(field)));
+      case MAX -> Aggregation.of(a -> a.max(m -> m.field(field)));
+      case UNIQUE -> Aggregation.of(a -> a.cardinality(c -> c.field(field)));
+    };
+  }
+
+  static List<FormulaHolder> getFormulaList(String formula) {
+    List<FormulaHolder> formulas = new ArrayList<>();
+    if (formula == null) {
+      return formulas;
+    }
+    Pattern pattern = Pattern.compile(DataInsightSystemChartRepository.FORMULA_FUNC_REGEX);
+    Matcher matcher = pattern.matcher(formula);
+    while (matcher.find()) {
+      FormulaHolder holder = new FormulaHolder();
+      holder.setFormula(matcher.group());
+      holder.setFunction(Function.valueOf(matcher.group(1).toUpperCase()));
+      if (matcher.group(5) != null) {
+        holder.setQuery(matcher.group(5));
+      }
+      formulas.add(holder);
+    }
+    return formulas;
+  }
+
+  /**
+   * Builds one aggregation per formula term and returns, in precedence order, the wrapper
+   * aggregations a categorical axis may rank itself by.
+   *
+   * <p>Only a metric-level filter yields order keys. A term's own {@code q=} narrows that term
+   * alone, so ranking by it would pick the categories satisfying one operand of the formula rather
+   * than the population the formula is evaluated over.
+   */
+  static List<String> getDateHistogramByFormula(
+      String formula,
+      Query filter,
+      Map<String, Aggregation> aggregationsMap,
+      String parentAggName,
+      List<FormulaHolder> formulas) {
+    Pattern pattern = Pattern.compile(DataInsightSystemChartRepository.FORMULA_FUNC_REGEX);
+    Matcher matcher = pattern.matcher(formula);
+    List<String> unnarrowed = new ArrayList<>();
+    List<String> narrowed = new ArrayList<>();
+    int index = 0;
+    while (matcher.find()) {
+      FormulaHolder holder = new FormulaHolder();
+      holder.setFormula(matcher.group());
+      holder.setFunction(Function.valueOf(matcher.group(1).toUpperCase()));
+      String field;
+      if (matcher.group(3) != null) {
+        field = matcher.group(3);
+      } else {
+        field = "id.keyword";
+      }
+      Aggregation subAgg =
+          getSubAggregationsByFunction(
+              Function.valueOf(matcher.group(1).toUpperCase()), field, index);
+
+      if (matcher.group(5) != null) {
+        Query queryBuilder;
+        if (filter != null) {
+          queryBuilder =
+              Query.of(
+                  q ->
+                      q.bool(
+                          b ->
+                              b.must(
+                                      Query.of(
+                                          mq ->
+                                              mq.queryString(
+                                                  qs -> qs.query(matcher.group(5)).lenient(true))))
+                                  .must(filter)));
+        } else {
+          queryBuilder =
+              Query.of(q -> q.queryString(qs -> qs.query(matcher.group(5)).lenient(true)));
+        }
+
+        Map<String, Aggregation> subAggMap = new HashMap<>();
+        subAggMap.put(field + index, subAgg);
+        aggregationsMap.put(
+            DataInsightMetricFilter.FILTER_AGG_KEY + index,
+            Aggregation.of(a -> a.filter(queryBuilder).aggregations(subAggMap)));
+        narrowed.add(DataInsightMetricFilter.FILTER_AGG_KEY + index);
+        holder.setQuery(matcher.group(5));
+      } else {
+        if (filter != null) {
+          Map<String, Aggregation> subAggMap = new HashMap<>();
+          subAggMap.put(field + index, subAgg);
+          aggregationsMap.put(
+              DataInsightMetricFilter.FILTER_AGG_KEY + index,
+              Aggregation.of(a -> a.filter(filter).aggregations(subAggMap)));
+          unnarrowed.add(DataInsightMetricFilter.FILTER_AGG_KEY + index);
+        } else {
+          aggregationsMap.put(field + index, subAgg);
+        }
+      }
+      formulas.add(holder);
+      index++;
+    }
+    if (filter == null) {
+      return List.of();
+    }
+    unnarrowed.addAll(narrowed);
+    return unnarrowed;
+  }
+
+  private List<DataInsightCustomChartResult> processMultiAggregations(
+      Map<String, Aggregate> aggregations,
+      String formula,
+      String group,
+      List<FormulaHolder> holder,
+      String metric) {
+    List<DataInsightCustomChartResult> finalList = new ArrayList<>();
+
+    List<List<DataInsightCustomChartResult>> results =
+        processAggregationsInternal(aggregations, group, metric);
+    for (List<DataInsightCustomChartResult> result : results) {
+      String formulaCopy = formula;
+      if (holder.size() != result.size()) {
+        continue;
+      }
+      boolean evaluate = true;
+      Double day = null;
+      String term = null;
+      for (int i = 0; i < holder.size(); i++) {
+        if (result.get(i).getCount() == null) {
+          evaluate = false;
+          break;
+        }
+        day = result.get(i).getDay();
+        term = result.get(i).getTerm();
+        formulaCopy =
+            formulaCopy.replace(holder.get(i).getFormula(), result.get(i).getCount().toString());
+      }
+      if (evaluate
+          && formulaCopy.matches(DataInsightFormulaEvaluator.NUMERIC_VALIDATION_REGEX)
+          && (day != null || term != null)) {
+        Double value = DataInsightFormulaEvaluator.evaluate(formulaCopy);
+        // Convert NaN and Infinite values to 0.0
+        if (value == null || value.isNaN() || value.isInfinite()) {
+          value = 0.0;
+        }
+        if (day != null) {
+          finalList.add(
+              new DataInsightCustomChartResult()
+                  .withCount(value)
+                  .withGroup(group)
+                  .withDay(day)
+                  .withMetric(metric));
+        } else {
+          finalList.add(
+              new DataInsightCustomChartResult()
+                  .withCount(value)
+                  .withGroup(group)
+                  .withTerm(term)
+                  .withMetric(metric));
+        }
+      }
+    }
+    return finalList;
+  }
+
+  /**
+   * Engine query for a filter's extracted query text, or null only when the metric declares none.
+   *
+   * <p>A filter that was declared but cannot be mapped is an error, not an absent filter. Returning
+   * null for both would leave {@link #populateDateHistogram} building the metric as an unfiltered
+   * leaf, so the chart reports a plausible number counted over every document instead of the subset
+   * the filter asked for. That is the failure the whole filter path exists to prevent, and it is
+   * silent: the request still returns 200.
+   *
+   * <p>This parses client side where the OpenSearch wrapper sends the query verbatim and lets the
+   * cluster reject it. Failing here keeps the two engines answering the same way rather than one
+   * erroring and the other quietly widening the aggregation.
+   */
+  static Query queryFromJson(String queryJson) {
+    if (queryJson == null) {
+      return null;
+    }
+    try {
+      return Query.of(q -> q.withJson(new StringReader(queryJson)));
+    } catch (RuntimeException e) {
+      throw new IllegalArgumentException(
+          "Data Insight metric filter cannot be mapped by the Elasticsearch client: " + queryJson,
+          e);
+    }
+  }
+
+  /**
+   * Builds a metric's sub-aggregations and returns the wrapper aggregations a categorical axis may
+   * rank itself by, in precedence order — empty when the metric declares no filter.
+   *
+   * <p>The keys come from the same pass that builds the wrappers, so an order path can only name an
+   * aggregation that is really in the request. Deciding separately from the chart definition would
+   * name a wrapper for a filter this client silently drops, and the engine rejects the whole search.
+   */
+  default List<String> populateDateHistogram(
+      Function function,
+      String formula,
+      String field,
+      String filter,
+      Map<String, Aggregation> aggregationsMap,
+      String parentAggName,
+      List<FormulaHolder> formulas) {
+    if (function == null && formula == null) {
+      throw new IllegalArgumentException(
+          "Data Insight chart metric must define either a function or a formula");
+    }
+    Query queryFilter = queryFromJson(DataInsightMetricFilter.queryJson(filter));
+    if (formula != null) {
+      return getDateHistogramByFormula(
+          formula, queryFilter, aggregationsMap, parentAggName, formulas);
+    }
+
+    Aggregation subAgg = getSubAggregationsByFunction(function, field, 0);
+    if (queryFilter == null) {
+      aggregationsMap.put(field + "0", subAgg);
+      return List.of();
+    }
+    Map<String, Aggregation> subAggMap = new HashMap<>();
+    subAggMap.put(field + "0", subAgg);
+    aggregationsMap.put(
+        DataInsightMetricFilter.FILTER_AGG_KEY,
+        Aggregation.of(a -> a.filter(queryFilter).aggregations(subAggMap)));
+    return List.of(DataInsightMetricFilter.FILTER_AGG_KEY);
+  }
+
+  SearchRequest prepareSearchRequest(
+      @NotNull DataInsightCustomChart diChart,
+      long start,
+      long end,
+      List<FormulaHolder> formulas,
+      Map metricHolder,
+      boolean live);
+
+  DataInsightCustomChartResultList processSearchResponse(
+      @NotNull DataInsightCustomChart diChart,
+      SearchResponse<JsonData> searchResponse,
+      List<FormulaHolder> formulas,
+      Map metricHolder);
+
+  default List<DataInsightCustomChartResult> processAggregations(
+      Map<String, Aggregate> aggregations,
+      String formula,
+      String group,
+      List<FormulaHolder> holder,
+      String metric) {
+    if (formula != null) {
+      return processMultiAggregations(aggregations, formula, group, holder, metric);
+    }
+    return processSingleAggregations(aggregations, group, metric);
+  }
+
+  private List<DataInsightCustomChartResult> processSingleAggregations(
+      Map<String, Aggregate> aggregations, String group, String metric) {
+    List<List<DataInsightCustomChartResult>> rawResultList =
+        processAggregationsInternal(aggregations, group, metric);
+    List<DataInsightCustomChartResult> finalResult = new ArrayList<>();
+    for (List<DataInsightCustomChartResult> diResultList : rawResultList) {
+      finalResult.addAll(diResultList);
+    }
+    return finalResult;
+  }
+
+  /**
+   * Extracts the numeric index from aggregation key names.
+   * Keys follow patterns like "filter0", "filter1", "id.keyword0", "id.keyword1",
+   * etc.
+   * The index is always the trailing digits in the key name.
+   */
+  private static int extractAggregationIndex(String key) {
+    // Extract trailing digits from the key
+    int i = key.length() - 1;
+    while (i >= 0 && Character.isDigit(key.charAt(i))) {
+      i--;
+    }
+    if (i < key.length() - 1) {
+      return Integer.parseInt(key.substring(i + 1));
+    }
+    return Integer.MAX_VALUE; // Keys without numeric suffix go last
+  }
+
+  /**
+   * Returns a sorted list of aggregation entries by their numeric index.
+   * This ensures consistent ordering regardless of the underlying map
+   * implementation.
+   */
+  private static List<Map.Entry<String, Aggregate>> getSortedAggregationEntries(
+      Map<String, Aggregate> aggregations) {
+    List<Map.Entry<String, Aggregate>> entries = new ArrayList<>(aggregations.entrySet());
+    entries.sort(Comparator.comparingInt(e -> extractAggregationIndex(e.getKey())));
+    return entries;
+  }
+
+  private List<List<DataInsightCustomChartResult>> processAggregationsInternal(
+      Map<String, Aggregate> aggregations, String group, String metric) {
+    List<List<DataInsightCustomChartResult>> results = new ArrayList<>();
+    for (Map.Entry<String, Aggregate> entry : aggregations.entrySet()) {
+      Aggregate agg = entry.getValue();
+      if (agg.isSterms()) {
+        for (StringTermsBucket bucket : agg.sterms().buckets().array()) {
+          List<DataInsightCustomChartResult> subResults = new ArrayList<>();
+          // Sort entries by their numeric index to ensure correct formula substitution
+          // order
+          for (Map.Entry<String, Aggregate> subEntry :
+              getSortedAggregationEntries(bucket.aggregations())) {
+            addByAggregationType(
+                subEntry.getValue(), subResults, bucket.key().stringValue(), group, false, metric);
+          }
+          results.add(subResults);
+        }
+      } else if (agg.isDateHistogram()) {
+        for (DateHistogramBucket bucket : agg.dateHistogram().buckets().array()) {
+          List<DataInsightCustomChartResult> subResults = new ArrayList<>();
+          // Sort entries by their numeric index to ensure correct formula substitution
+          // order
+          for (Map.Entry<String, Aggregate> subEntry :
+              getSortedAggregationEntries(bucket.aggregations())) {
+            addByAggregationType(
+                subEntry.getValue(), subResults, String.valueOf(bucket.key()), group, true, metric);
+          }
+          results.add(subResults);
+        }
+      }
+    }
+    return results;
+  }
+
+  private void addByAggregationType(
+      Aggregate agg,
+      List<DataInsightCustomChartResult> diChartResults,
+      String key,
+      String group,
+      boolean isTimeStamp,
+      String metric) {
+    if (agg.isValueCount()) {
+      addProcessedSubResult(agg.valueCount(), diChartResults, key, group, isTimeStamp, metric);
+    } else if (agg.isCardinality()) {
+      addProcessedSubResult(agg.cardinality(), diChartResults, key, group, isTimeStamp, metric);
+    } else if (agg.isSum() || agg.isAvg() || agg.isMin() || agg.isMax()) {
+      SingleMetricAggregateBase metricAgg = null;
+      if (agg.isSum()) metricAgg = agg.sum();
+      else if (agg.isAvg()) metricAgg = agg.avg();
+      else if (agg.isMin()) metricAgg = agg.min();
+      else if (agg.isMax()) metricAgg = agg.max();
+
+      if (metricAgg != null) {
+        addProcessedSubResult(metricAgg, diChartResults, key, group, isTimeStamp, metric);
+      }
+    } else if (agg.isFilter()) {
+      addProcessedSubResult(agg.filter(), diChartResults, key, group, isTimeStamp, metric);
+    }
+  }
+
+  private DataInsightCustomChartResult getDIChartResult(
+      Double value, String key, String group, boolean isTimestamp, String metric) {
+    if (isTimestamp)
+      return new DataInsightCustomChartResult()
+          .withCount(value)
+          .withDay(Double.valueOf(key))
+          .withGroup(group)
+          .withMetric(metric);
+    return new DataInsightCustomChartResult()
+        .withCount(value)
+        .withGroup(group)
+        .withTerm(key)
+        .withMetric(metric);
+  }
+
+  private void addProcessedSubResult(
+      CardinalityAggregate aggregation,
+      List<DataInsightCustomChartResult> diChartResults,
+      String key,
+      String group,
+      boolean isTimeStamp,
+      String metric) {
+    double value = (double) aggregation.value();
+    if (!Double.isInfinite(value)) {
+      DataInsightCustomChartResult diChartResult =
+          getDIChartResult(value, key, group, isTimeStamp, metric);
+      diChartResults.add(diChartResult);
+    }
+  }
+
+  private void addProcessedSubResult(
+      SingleMetricAggregateBase aggregation,
+      List<DataInsightCustomChartResult> diChartResults,
+      String key,
+      String group,
+      boolean isTimeStamp,
+      String metric) {
+    // Covers value_count as well: ValueCountAggregate extends this type, so both bind here.
+    // avg/min/max over a bucket the metric filter emptied return a null value, not NaN.
+    // Unboxing that throws, and the whole chart request dies with a 500.
+    Double value = aggregation.value();
+    if (value != null && !value.isInfinite() && !value.isNaN()) {
+      DataInsightCustomChartResult diChartResult =
+          getDIChartResult(value, key, group, isTimeStamp, metric);
+      diChartResults.add(diChartResult);
+    }
+  }
+
+  private void addProcessedSubResult(
+      FilterAggregate aggregation,
+      List<DataInsightCustomChartResult> diChartResults,
+      String key,
+      String group,
+      boolean isTimeStamp,
+      String metric) {
+    for (Map.Entry<String, Aggregate> entry : aggregation.aggregations().entrySet()) {
+      addByAggregationType(entry.getValue(), diChartResults, key, group, isTimeStamp, metric);
+    }
+  }
+}

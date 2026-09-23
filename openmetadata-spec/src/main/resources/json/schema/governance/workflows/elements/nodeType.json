@@ -1,0 +1,15 @@
+{
+  "$id": "https://open-metadata.org/schema/governance/workflows/elements/nodeType.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NodeType",
+  "javaType": "org.openmetadata.schema.governance.workflows.elements.NodeType",
+  "description": "Type of the Node.",
+  "type": "string",
+  "enum": [
+    "automatedTask",
+    "userTask",
+    "endEvent",
+    "startEvent",
+    "gateway"
+  ]
+}

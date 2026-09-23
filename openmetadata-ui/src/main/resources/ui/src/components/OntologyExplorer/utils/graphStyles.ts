@@ -1,0 +1,1183 @@
+/*
+ *  Copyright 2026 Collate.
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+import {
+  Circle as GCircle,
+  Group,
+  Image as GImage,
+  Line as GLine,
+  Rect as GRect,
+  Text as GText,
+} from '@antv/g';
+import {
+  Circle,
+  ExtensionCategory,
+  Line,
+  LineStyleProps,
+  Quadratic,
+  QuadraticStyleProps,
+  Rect as RectNode,
+  RectCombo,
+  RectComboStyleProps,
+  RectStyleProps,
+  register,
+} from '@antv/g6';
+import { RelationshipType } from '../../../generated/entity/data/relationshipType';
+import { resolveCssColor } from '../../../utils/common/cssColor.utils';
+import {
+  COLOR_META_BY_HEX,
+  COMBO_COLOR_FALLBACK,
+  COMBO_FILL_DEFAULT,
+  COMBO_HEADER_HEIGHT,
+  COMBO_INTERIOR_PADDING_SIDES,
+  COMBO_INTERIOR_PADDING_TOP,
+  COMBO_LABEL_FONT_SIZE,
+  COMBO_LABEL_FONT_WEIGHT,
+  COMBO_LABEL_PADDING_LEFT,
+  COMBO_LABEL_PADDING_TOP_BOTTOM,
+  COMBO_LINE_WIDTH,
+  COMBO_RADIUS,
+  DATA_MODE_ASSET_BADGE_Z_INDEX,
+  DATA_MODE_ASSET_CARD_CLEAR_BELOW_CIRCLE,
+  DATA_MODE_ASSET_CARD_INSET_H,
+  DATA_MODE_ASSET_CIRCLE_SIZE,
+  DATA_MODE_ASSET_LABEL_BOX_MIN_WIDTH,
+  DATA_MODE_ASSET_LABEL_BOX_PADDING,
+  DATA_MODE_ASSET_LABEL_BOX_RADIUS,
+  DATA_MODE_ASSET_LABEL_FONT_SIZE,
+  DATA_MODE_ASSET_LABEL_FONT_WEIGHT,
+  DATA_MODE_ASSET_LINE_WIDTH,
+  DATA_MODE_ASSET_NAME_ENTITY_GAP,
+  DATA_MODE_ASSET_NAME_MAX_TEXT_WIDTH_PX,
+  DATA_MODE_ASSET_ROW_MAX_WIDTH,
+  DATA_MODE_ENTITY_BADGE_BORDER_FALLBACK,
+  DATA_MODE_ENTITY_BADGE_FONT_SIZE,
+  DATA_MODE_ENTITY_BADGE_VERTICAL_NUDGE_UP,
+  DATA_MODE_ENTITY_PILL_ICON_GAP_AFTER,
+  DATA_MODE_ENTITY_PILL_ICON_NUDGE_UP,
+  DATA_MODE_ENTITY_PILL_ICON_PAD_LEFT,
+  DATA_MODE_ENTITY_PILL_ICON_SIZE,
+  DATA_MODE_ENTITY_PILL_TRIM_RIGHT_PX,
+  DATA_MODE_LABEL_OFFSET_Y,
+  DATA_MODE_TERM_HALO_LINE_WIDTH,
+  DATA_MODE_TERM_HALO_SHADOW_BLUR,
+  DATA_MODE_TERM_HALO_SHADOW_COLOR,
+  DATA_MODE_TERM_HALO_STROKE,
+  DATA_MODE_TERM_HALO_STROKE_OPACITY,
+  DATA_MODE_TERM_LABEL_BG_RADIUS,
+  DATA_MODE_TERM_LABEL_FONT_WEIGHT,
+  DATA_MODE_TERM_LABEL_SHADOW_BLUR,
+  DATA_MODE_TERM_LABEL_SHADOW_COLOR,
+  DATA_MODE_TERM_LABEL_SHADOW_OFFSET_Y,
+  DATA_MODE_TERM_NODE_SHADOW_BLUR,
+  DATA_MODE_TERM_NODE_SHADOW_COLOR,
+  DATA_MODE_TERM_NODE_SHADOW_OFFSET_Y,
+  DATA_MODE_TERM_NODE_SIZE,
+  DATA_MODE_TERM_NODE_STROKE_WIDTH,
+  EDGE_LABEL_BG_FILL,
+  EDGE_LABEL_BG_RADIUS,
+  EDGE_LABEL_BG_SHADOW_BLUR,
+  EDGE_LABEL_BG_SHADOW_COLOR,
+  EDGE_LABEL_BG_SHADOW_OFFSET_Y,
+  EDGE_LABEL_BG_STROKE,
+  EDGE_LABEL_FILL,
+  EDGE_LABEL_FONT_FAMILY,
+  EDGE_LABEL_FONT_SIZE,
+  EDGE_LABEL_FONT_WEIGHT,
+  EDGE_LABEL_LETTER_SPACING,
+  LABEL_TEXT_ALIGN_LEFT,
+  NODE_BORDER_COLOR,
+  NODE_BORDER_RADIUS,
+  NODE_FILL_DEFAULT,
+  NODE_LABEL_FILL,
+  NODE_LABEL_FILL_FALLBACK,
+  NODE_LABEL_FILL_INVERSE,
+  NODE_LABEL_FONT_SIZE,
+  NODE_LABEL_FONT_WEIGHT,
+  NODE_LABEL_PADDING,
+  NODE_LINE_WIDTH,
+  NODE_SHADOW_BLUR,
+  NODE_SHADOW_COLOR,
+  NODE_SHADOW_COLOR_FALLBACK,
+  NODE_SHADOW_OFFSET_Y,
+  RELATION_META,
+  TERM_LABEL_BG_PADDING,
+} from '../OntologyExplorer.constants';
+import { computeCardinalityLabelAttrs } from './cardinalityLabelUtils';
+import './ontologyComboAwarePolylineEdge';
+import { getRelationshipColor } from './relationshipTypeUtils';
+import {
+  getStudioEditPortCircleStyle,
+  getStudioEditPortPlusLineStyles,
+} from './studioEditPortStyles';
+import {
+  getCanvasContext,
+  measureTextWidth,
+  truncateToFit,
+} from './textMeasure';
+
+export const CARDINALITY_AWARE_LINE_EDGE_TYPE = 'cardinality-aware-line';
+export const CARDINALITY_AWARE_QUADRATIC_EDGE_TYPE =
+  'cardinality-aware-quadratic';
+
+type CardinalityEndpoint = [number, number];
+
+function drawCardinalityLabels(
+  attributes: Record<string, unknown>,
+  endpoints: [CardinalityEndpoint, CardinalityEndpoint],
+  upsertLabel: (
+    key: string,
+    labelAttributes: ReturnType<typeof computeCardinalityLabelAttrs>
+  ) => void
+) {
+  (['start', 'end'] as const).forEach((end) => {
+    upsertLabel(
+      `cardinality-${end}`,
+      computeCardinalityLabelAttrs(attributes, endpoints, end)
+    );
+  });
+}
+
+class CardinalityAwareLine extends Line {
+  override render(
+    attributes: Required<LineStyleProps>,
+    container: Group
+  ): void {
+    super.render(attributes, container);
+    const [start, end] = this.getEndpoints(attributes);
+    drawCardinalityLabels(
+      attributes as Record<string, unknown>,
+      [start as CardinalityEndpoint, end as CardinalityEndpoint],
+      (key, labelAttributes) =>
+        this.upsert(key, GText, labelAttributes, container)
+    );
+  }
+}
+
+class CardinalityAwareQuadratic extends Quadratic {
+  override render(
+    attributes: Required<QuadraticStyleProps>,
+    container: Group
+  ): void {
+    super.render(attributes, container);
+    const endpoints = this.getEndpoints(attributes);
+    drawCardinalityLabels(
+      attributes as Record<string, unknown>,
+      [endpoints[0] as [number, number], endpoints[1] as [number, number]],
+      (key, labelAttributes) =>
+        this.upsert(key, GText, labelAttributes, container)
+    );
+  }
+}
+register(
+  ExtensionCategory.EDGE,
+  CARDINALITY_AWARE_LINE_EDGE_TYPE,
+  CardinalityAwareLine
+);
+register(
+  ExtensionCategory.EDGE,
+  CARDINALITY_AWARE_QUADRATIC_EDGE_TYPE,
+  CardinalityAwareQuadratic
+);
+
+const COMBO_LABEL_CHAR_WIDTH = 7;
+const COMBO_LABEL_MEASURE_FONT = `${COMBO_LABEL_FONT_WEIGHT} ${COMBO_LABEL_FONT_SIZE}px sans-serif`;
+
+export const getCanvasColor = resolveCssColor;
+
+export const STUDIO_EDIT_PORT_KEY = 'ontology-edit';
+export const STUDIO_EDIT_PORT_CLASS_NAME = `port-${STUDIO_EDIT_PORT_KEY}`;
+
+class StudioTermNode extends RectNode {
+  override render(
+    attributes: Required<RectStyleProps>,
+    container: Group
+  ): void {
+    super.render({ ...attributes, label: false }, container);
+    const attrs = attributes as Record<string, unknown>;
+    const keyShape = this.getShape('key');
+    const bounds = keyShape?.getLocalBounds();
+    if (!bounds) {
+      return;
+    }
+
+    const centerY = (bounds.min[1] + bounds.max[1]) / 2;
+    const dotCenterX = bounds.min[0] + 15.5;
+    const labelX = bounds.min[0] + 26;
+    const accentColor =
+      typeof attrs.studioAccentColor === 'string'
+        ? getCanvasColor(attrs.studioAccentColor, '#84CAFF')
+        : '#84CAFF';
+
+    this.upsert(
+      'studio-dot',
+      GCircle,
+      {
+        cx: dotCenterX,
+        cy: centerY,
+        r: 3.5,
+        fill: accentColor,
+      },
+      container
+    );
+    this.upsert(
+      'studio-label',
+      GText,
+      {
+        x: labelX,
+        y: centerY,
+        text: String(attrs.studioLabelText ?? ''),
+        fill: getCanvasColor(NODE_LABEL_FILL, NODE_LABEL_FILL_FALLBACK),
+        fontFamily: 'Inter',
+        fontSize: NODE_LABEL_FONT_SIZE,
+        fontWeight: NODE_LABEL_FONT_WEIGHT,
+        textAlign: 'left',
+        textBaseline: 'middle',
+      },
+      container
+    );
+    const plusLineStyles = getStudioEditPortPlusLineStyles(
+      bounds.max[0],
+      centerY
+    );
+    this.upsert(
+      'studio-edit-port-circle',
+      GCircle,
+      attrs.studioEditMode === true
+        ? getStudioEditPortCircleStyle(bounds.max[0], centerY)
+        : false,
+      container
+    );
+    const editPortCircle = this.getShape('studio-edit-port-circle');
+    if (editPortCircle) {
+      editPortCircle.className = STUDIO_EDIT_PORT_CLASS_NAME;
+    }
+    this.upsert(
+      'studio-edit-port-plus-horizontal',
+      GLine,
+      attrs.studioEditMode === true ? plusLineStyles[0] : false,
+      container
+    );
+    this.upsert(
+      'studio-edit-port-plus-vertical',
+      GLine,
+      attrs.studioEditMode === true ? plusLineStyles[1] : false,
+      container
+    );
+  }
+}
+register(ExtensionCategory.NODE, 'studio-term', StudioTermNode);
+
+const GLOSSARY_HEADER_MIX_ACCENT = 0.11;
+
+function parseColorToRgbTriplet(val: string): [number, number, number] | null {
+  const v = val.trim();
+  const hex = v.match(/^#([0-9a-fA-F]{6})$/);
+  if (hex) {
+    const h = hex[1];
+
+    return [
+      parseInt(h.slice(0, 2), 16),
+      parseInt(h.slice(2, 4), 16),
+      parseInt(h.slice(4, 6), 16),
+    ];
+  }
+  const rgbSp = v.match(/^rgba?\(\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)/);
+  if (rgbSp) {
+    return [Number(rgbSp[1]), Number(rgbSp[2]), Number(rgbSp[3])];
+  }
+  const rgbComma = v.match(/^rgba?\(\s*([\d.]+),\s*([\d.]+),\s*([\d.]+)/);
+  if (rgbComma) {
+    return [Number(rgbComma[1]), Number(rgbComma[2]), Number(rgbComma[3])];
+  }
+
+  return null;
+}
+
+function mixAccentLikeScale50(rgb: [number, number, number]): string {
+  const t = GLOSSARY_HEADER_MIX_ACCENT;
+  const clamp = (n: number) => Math.min(255, Math.max(0, n));
+  const r = clamp(Math.round(rgb[0] * t + 255 * (1 - t)));
+  const g = clamp(Math.round(rgb[1] * t + 255 * (1 - t)));
+  const b = clamp(Math.round(rgb[2] * t + 255 * (1 - t)));
+  const x = (n: number) => n.toString(16).padStart(2, '0');
+
+  return `#${x(r)}${x(g)}${x(b)}`;
+}
+
+/**
+ * Glossary combo header: light "50" wash matching the glossary accent (title + border stroke).
+ * For `var(--color-*-scale)` strokes, resolves `var(--color-*-50)`. For hex palette strokes, blends toward white.
+ */
+export function glossaryComboHeaderFill(stroke: string): string {
+  const blendTowardWhite = (): string => {
+    const resolved = stroke.startsWith('var(')
+      ? getCanvasColor(stroke, '#94a3b8')
+      : stroke;
+    const rgb = parseColorToRgbTriplet(resolved);
+
+    return rgb ? mixAccentLikeScale50(rgb) : '#f8fafc';
+  };
+
+  if (stroke.startsWith('var(')) {
+    const m = stroke.match(/^var\((--color-[a-z0-9-]+)-\d{2,3}\)$/i);
+    if (m) {
+      return getCanvasColor(`var(${m[1]}-50)`, blendTowardWhite());
+    }
+  }
+
+  return blendTowardWhite();
+}
+
+export const LABEL_PLACEMENT_BOTTOM = 'bottom';
+export const LABEL_PLACEMENT_CENTER = 'center';
+export const LABEL_PLACEMENT_TOP_LEFT = 'top-left';
+
+export class GlossaryCombo extends RectCombo {
+  protected override getExpandedKeySize(
+    attributes: Required<RectComboStyleProps>
+  ): [number, number, number] {
+    const [w, h, d] = super.getExpandedKeySize(attributes);
+    const attrs = attributes as Record<string, unknown>;
+    const minW =
+      typeof attrs.minWidth === 'number' ? (attrs.minWidth as number) : 0;
+    const minH =
+      typeof attrs.minHeight === 'number' ? (attrs.minHeight as number) : 0;
+
+    return [Math.max(w, minW), Math.max(h, minH), d];
+  }
+
+  protected drawLabelShape(
+    attributes: Required<RectComboStyleProps>,
+    container: Group
+  ): void {
+    const keyShape = this.getShape('key');
+    if (keyShape) {
+      const bounds = keyShape.getLocalBounds();
+      const comboWidth = bounds.max[0] - bounds.min[0];
+      const color =
+        typeof attributes.stroke === 'string' ? attributes.stroke : '#94a3b8';
+      const lw =
+        typeof attributes.lineWidth === 'number'
+          ? attributes.lineWidth
+          : COMBO_LINE_WIDTH;
+      const inset = lw / 2;
+      const headerX = bounds.min[0] + inset;
+      const headerY = bounds.min[1] + inset;
+      const headerW = Math.max(0, comboWidth - 2 * inset);
+      const headerH = Math.max(0, COMBO_HEADER_HEIGHT - inset);
+      const topRadius = Math.max(0, COMBO_RADIUS - inset);
+      this.upsert(
+        'header-bg',
+        GRect,
+        {
+          x: headerX,
+          y: headerY,
+          width: headerW,
+          height: headerH,
+          fill: glossaryComboHeaderFill(color),
+          stroke: 'none',
+          lineWidth: 0,
+          radius: [topRadius, topRadius, 0, 0],
+        },
+        container
+      );
+
+      const labelText = String(attributes.labelText ?? '');
+      const labelFill =
+        typeof attributes.labelFill === 'string' ? attributes.labelFill : color;
+      const labelFontSize =
+        typeof attributes.labelFontSize === 'number'
+          ? attributes.labelFontSize
+          : 12;
+      const x = headerX + COMBO_LABEL_PADDING_LEFT;
+      const y = headerY + headerH / 2;
+      const maxLabelWidth = Math.max(
+        16,
+        headerW - COMBO_LABEL_PADDING_LEFT * 2
+      );
+      const truncatedLabelText = truncateToFit(
+        labelText,
+        maxLabelWidth,
+        COMBO_LABEL_MEASURE_FONT,
+        COMBO_LABEL_CHAR_WIDTH
+      );
+
+      this.upsert(
+        'combo-label',
+        GText,
+        {
+          x,
+          y,
+          text: truncatedLabelText,
+          fill: labelFill,
+          fontSize: labelFontSize,
+          fontWeight: COMBO_LABEL_FONT_WEIGHT,
+          textBaseline: 'middle',
+          textAlign: 'left',
+        },
+        container
+      );
+    }
+  }
+}
+register(ExtensionCategory.COMBO, 'glossary-combo', GlossaryCombo);
+
+const ENTITY_ICON_SECTION_W =
+  DATA_MODE_ENTITY_PILL_ICON_PAD_LEFT +
+  DATA_MODE_ENTITY_PILL_ICON_SIZE +
+  DATA_MODE_ENTITY_PILL_ICON_GAP_AFTER;
+
+class DataModeAssetNode extends Circle {
+  override render(
+    attributes: Parameters<Circle['render']>[0],
+    container: Group
+  ): void {
+    super.render(attributes, container);
+    const attrs = attributes as Record<string, unknown>;
+    const testId = attrs['testId'];
+    const nodeId = attrs['nodeId'];
+    const keyShape = this.getShape('key');
+    if (typeof testId === 'string' && testId.length > 0) {
+      keyShape?.setAttribute('data-testid', testId);
+    }
+    if (typeof nodeId === 'string' && nodeId.length > 0) {
+      keyShape?.setAttribute('data-node-id', nodeId);
+    }
+    const iconSrc = attrs['entityIconSrc'];
+    const iconX = attrs['entityIconX'];
+    const iconY = attrs['entityIconY'];
+    if (typeof iconSrc === 'string' && iconSrc) {
+      this.upsert(
+        'entity-icon',
+        GImage,
+        {
+          x: typeof iconX === 'number' ? iconX : 0,
+          y: typeof iconY === 'number' ? iconY : 0,
+          width: DATA_MODE_ENTITY_PILL_ICON_SIZE,
+          height: DATA_MODE_ENTITY_PILL_ICON_SIZE,
+          src: iconSrc,
+        },
+        container
+      );
+    }
+  }
+}
+register(ExtensionCategory.NODE, 'data-mode-asset', DataModeAssetNode);
+
+export function formatRelationLabel(relationType: string): string {
+  return relationType
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .trim()
+    .toUpperCase();
+}
+
+export function truncateHierarchyBadgeToFitWidth(
+  text: string,
+  maxContentWidthPx: number,
+  fontSize: number
+): string {
+  const t = text.trim();
+  if (t.length === 0) {
+    return t;
+  }
+  const w = Math.max(12, maxContentWidthPx);
+  const avgCharPx = Math.max(5.5, fontSize * 0.65);
+  const maxChars = Math.max(4, Math.floor(w / avgCharPx));
+  if (t.length <= maxChars) {
+    return t;
+  }
+  if (maxChars <= 1) {
+    return '\u2026';
+  }
+
+  return `${t.slice(0, maxChars - 1)}\u2026`;
+}
+
+const EDGE_LABEL_OFFSET_Y = 0;
+const EDGE_LABEL_BADGE_PADDING: [number, number, number, number] = [4, 8, 4, 8];
+const EDGE_LABEL_BADGE_RADIUS = 6;
+const EDGE_LABEL_BADGE_FONT_WEIGHT = 700;
+const STUDIO_EDGE_LABEL_PADDING: [number, number, number, number] = [
+  2, 7, 2, 7,
+];
+const STUDIO_EDGE_BORDER_BY_COLOR: Record<string, string> = {
+  '#079455': '#ABEFC6',
+  '#0e9384': '#99E5D9',
+  '#1570ef': '#D1E9FF',
+  '#3538cd': '#C7D7FE',
+  '#5925dc': '#D9D6FE',
+  '#6172f3': '#C7D7FE',
+  '#717680': '#E9EAEB',
+  '#7a5af8': '#E3DEFC',
+  '#c11574': '#FCCEEE',
+  '#dc6803': '#FEDF89',
+  '#e31b54': '#FECDD6',
+};
+
+export function getEffectiveRelationColor(
+  relationType: string,
+  relationshipType: RelationshipType | undefined
+): string | undefined {
+  const configuredColor = relationshipType
+    ? getRelationshipColor(relationshipType)
+    : undefined;
+  const effectiveColor = relationshipType?.systemDefined
+    ? RELATION_META[relationType]?.color ?? configuredColor
+    : configuredColor ?? RELATION_META[relationType]?.color;
+
+  return effectiveColor;
+}
+
+type RelationMeta = { color: string; background: string; labelKey: string };
+
+const getBuiltInMeta = (
+  relationType?: string
+): RelationMeta | null | undefined =>
+  relationType != null
+    ? RELATION_META[relationType] ?? RELATION_META.default
+    : null;
+
+const getEffectiveMeta = (
+  effectiveColor: string | undefined,
+  builtInMeta: RelationMeta | null | undefined
+): RelationMeta | null | undefined =>
+  effectiveColor
+    ? COLOR_META_BY_HEX[effectiveColor.toLowerCase()] ?? builtInMeta
+    : builtInMeta;
+
+const getStudioBorderColor = (
+  relationColor: string | undefined
+): string | undefined =>
+  relationColor
+    ? STUDIO_EDGE_BORDER_BY_COLOR[relationColor.toLowerCase()]
+    : undefined;
+
+const getEdgeLabelBackgroundFill = (
+  studioMode: boolean,
+  meta: RelationMeta | null | undefined,
+  getColor: (cssVar: string, fallback: string) => string
+): string => {
+  if (studioMode) {
+    return '#FFFFFF';
+  }
+
+  return meta
+    ? getColor(meta.background, '#fafafa')
+    : getColor(EDGE_LABEL_BG_FILL, '#EFF1F8');
+};
+
+const getEdgeLabelBackgroundStroke = (
+  studioMode: boolean,
+  meta: RelationMeta | null | undefined,
+  studioBorderColor: string | undefined,
+  getColor: (cssVar: string, fallback: string) => string
+): string => {
+  if (studioMode) {
+    return studioBorderColor ?? '#E9EAEB';
+  }
+
+  return meta ? 'none' : getColor(EDGE_LABEL_BG_STROKE, '#FFF');
+};
+
+const getEdgeLabelBackgroundLineWidth = (
+  studioMode: boolean,
+  meta: RelationMeta | null | undefined
+): number => {
+  if (studioMode) {
+    return 1;
+  }
+
+  return meta ? 0 : 1;
+};
+
+const getEdgeLabelBackgroundRadius = (
+  studioMode: boolean,
+  meta: RelationMeta | null | undefined
+): number => {
+  if (studioMode) {
+    return 9999;
+  }
+
+  return meta ? EDGE_LABEL_BADGE_RADIUS : EDGE_LABEL_BG_RADIUS;
+};
+
+const getEdgeLabelBackgroundShadowColor = (
+  meta: RelationMeta | null | undefined,
+  getColor: (cssVar: string, fallback: string) => string
+): string =>
+  meta ? 'transparent' : getColor(EDGE_LABEL_BG_SHADOW_COLOR, '#EBEDF5');
+
+const getEdgeLabelFill = (
+  meta: RelationMeta | null | undefined,
+  getColor: (cssVar: string, fallback: string) => string
+): string =>
+  meta ? getColor(meta.color, '#717680') : getColor(EDGE_LABEL_FILL, '#8C93AE');
+
+const getEdgeLabelFontWeight = (
+  studioMode: boolean,
+  meta: RelationMeta | null | undefined
+): number => {
+  if (studioMode) {
+    return EDGE_LABEL_FONT_WEIGHT;
+  }
+
+  return meta ? EDGE_LABEL_BADGE_FONT_WEIGHT : EDGE_LABEL_FONT_WEIGHT;
+};
+
+export function getEdgeRelationLabelStyle(
+  labelText: string,
+  relationType?: string,
+  effectiveColor?: string,
+  studioMode = false,
+  getColor: (cssVar: string, fallback: string) => string = getCanvasColor
+): Record<string, unknown> {
+  const builtInMeta = getBuiltInMeta(relationType);
+  const meta = getEffectiveMeta(effectiveColor, builtInMeta);
+
+  const edgeLabelPadding = studioMode
+    ? STUDIO_EDGE_LABEL_PADDING
+    : EDGE_LABEL_BADGE_PADDING;
+  const relationColor = effectiveColor ?? meta?.color;
+  const studioBorderColor = getStudioBorderColor(relationColor);
+
+  return {
+    labelText,
+    labelPosition: 'center',
+    labelBackground: true,
+    labelBackgroundOpacity: 1,
+    labelBackgroundFill: getEdgeLabelBackgroundFill(studioMode, meta, getColor),
+    labelBackgroundStroke: getEdgeLabelBackgroundStroke(
+      studioMode,
+      meta,
+      studioBorderColor,
+      getColor
+    ),
+    labelBackgroundLineWidth: getEdgeLabelBackgroundLineWidth(studioMode, meta),
+    labelBackgroundRadius: getEdgeLabelBackgroundRadius(studioMode, meta),
+    labelPadding: edgeLabelPadding,
+    labelBackgroundShadowColor: getEdgeLabelBackgroundShadowColor(
+      meta,
+      getColor
+    ),
+    labelBackgroundShadowBlur: meta ? 0 : EDGE_LABEL_BG_SHADOW_BLUR,
+    labelBackgroundShadowOffsetY: meta ? 0 : EDGE_LABEL_BG_SHADOW_OFFSET_Y,
+    labelBackgroundShadowOffsetX: 0,
+    labelFill: getEdgeLabelFill(meta, getColor),
+    labelFontSize: EDGE_LABEL_FONT_SIZE,
+    labelFontWeight: getEdgeLabelFontWeight(studioMode, meta),
+    labelFontFamily: EDGE_LABEL_FONT_FAMILY,
+    labelLetterSpacing: EDGE_LABEL_LETTER_SPACING,
+    labelAutoRotate: true,
+    labelOffsetY: EDGE_LABEL_OFFSET_Y,
+    labelMaxWidth: 120,
+  };
+}
+
+export interface NodeStylePosition {
+  x: number;
+  y: number;
+}
+
+export function buildDefaultRectNodeStyle(
+  getColor: (cssVar: string, fallback: string) => string,
+  label: string,
+  size: [number, number],
+  pos?: NodeStylePosition
+): Record<string, unknown> {
+  return {
+    size,
+    fill: getColor(NODE_FILL_DEFAULT, '#ffffff'),
+    stroke: getColor(NODE_BORDER_COLOR, '#E9EAEB'),
+    lineWidth: NODE_LINE_WIDTH,
+    radius: NODE_BORDER_RADIUS,
+    icon: false,
+    labelText: label,
+    labelFill: getColor(NODE_LABEL_FILL, NODE_LABEL_FILL_FALLBACK),
+    labelFontSize: NODE_LABEL_FONT_SIZE,
+    labelFontWeight: NODE_LABEL_FONT_WEIGHT,
+    labelPlacement: LABEL_PLACEMENT_CENTER,
+    labelPadding: NODE_LABEL_PADDING,
+    shadowColor: getColor(NODE_SHADOW_COLOR, NODE_SHADOW_COLOR_FALLBACK),
+    shadowBlur: NODE_SHADOW_BLUR,
+    shadowOffsetY: NODE_SHADOW_OFFSET_Y,
+    ...(pos && { x: pos.x, y: pos.y }),
+  };
+}
+
+const DATA_MODE_ASSET_LABEL_CHAR_WIDTH_EST = 6.5;
+const DATA_MODE_ENTITY_TYPE_CHAR_WIDTH_EST = 5.5;
+const DATA_MODE_ENTITY_BADGE_H_PAD = 8;
+const DATA_MODE_ENTITY_BADGE_V_PAD = 2;
+const DATA_MODE_ENTITY_ICON_TEXT_GAP = 2;
+const DATA_MODE_ENTITY_ICON_RIGHT_PAD = DATA_MODE_ENTITY_PILL_ICON_PAD_LEFT;
+
+function getMeasureTextContext2d(): CanvasRenderingContext2D | null {
+  return getCanvasContext();
+}
+
+function measureCanvasTextWidthPx(
+  text: string,
+  font: string,
+  mode: 'advance' | 'ink' = 'advance'
+): number | undefined {
+  const context = getMeasureTextContext2d();
+  if (!context) {
+    return undefined;
+  }
+
+  try {
+    context.font = font;
+    const metrics = context.measureText(text);
+    let px = metrics.width;
+    if (mode === 'ink') {
+      const { actualBoundingBoxLeft, actualBoundingBoxRight } = metrics;
+      if (
+        typeof actualBoundingBoxLeft === 'number' &&
+        typeof actualBoundingBoxRight === 'number' &&
+        Number.isFinite(actualBoundingBoxLeft) &&
+        Number.isFinite(actualBoundingBoxRight)
+      ) {
+        const ink = actualBoundingBoxLeft + actualBoundingBoxRight;
+        if (ink > 0) {
+          px = ink;
+        }
+      }
+    }
+
+    return Math.max(1, Math.ceil(px));
+  } catch {
+    return undefined;
+  }
+}
+
+function truncateTextWithEllipsis(
+  text: string,
+  font: string,
+  maxPx: number
+): string {
+  const measured = measureCanvasTextWidthPx(text, font);
+  if (measured === undefined || measured <= maxPx) {
+    return text;
+  }
+  const ellipsis = '...';
+  const ellipsisW = measureCanvasTextWidthPx(ellipsis, font) ?? 12;
+  const target = Math.max(0, maxPx - ellipsisW);
+
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi + 1) / 2);
+    const w = measureCanvasTextWidthPx(text.slice(0, mid), font) ?? 0;
+    if (w <= target) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+
+  return lo === 0 ? ellipsis : text.slice(0, lo) + ellipsis;
+}
+
+// Node style for the plain "name only" asset card, used when there is no
+// entity-type badge to lay out alongside the name.
+const buildAssetOnlyNodeStyle = (
+  getColor: (cssVar: string, fallback: string) => string,
+  label: string,
+  nameMeasureFont: string,
+  hPad: number,
+  vPad: number,
+  pad: [number, number, number, number],
+  keyShapeBase: Record<string, unknown>
+): Record<string, unknown> => {
+  const rawTextW =
+    measureCanvasTextWidthPx(label, nameMeasureFont) ??
+    Math.ceil(label.length * DATA_MODE_ASSET_LABEL_CHAR_WIDTH_EST);
+  const textW = Math.min(
+    DATA_MODE_ASSET_NAME_MAX_TEXT_WIDTH_PX,
+    Math.max(12, rawTextW)
+  );
+  const boxW = Math.max(
+    DATA_MODE_ASSET_LABEL_BOX_MIN_WIDTH,
+    Math.min(DATA_MODE_ASSET_NAME_MAX_TEXT_WIDTH_PX + hPad, textW + hPad)
+  );
+  const maxTextW = Math.max(12, boxW - hPad);
+  const boxH = DATA_MODE_ASSET_LABEL_FONT_SIZE + vPad + 4;
+
+  return {
+    ...keyShapeBase,
+    labelText: label,
+    labelFill: getColor(NODE_LABEL_FILL, NODE_LABEL_FILL_FALLBACK),
+    labelFontSize: DATA_MODE_ASSET_LABEL_FONT_SIZE,
+    labelFontWeight: DATA_MODE_ASSET_LABEL_FONT_WEIGHT,
+    labelPlacement: LABEL_PLACEMENT_BOTTOM,
+    labelOffsetY: DATA_MODE_LABEL_OFFSET_Y,
+    labelTextAlign: 'center',
+    labelWordWrap: true,
+    labelMaxWidth: maxTextW,
+    labelMaxLines: 1,
+    labelTextOverflow: '...',
+    labelBackground: true,
+    labelBackgroundFill: getColor(EDGE_LABEL_BG_STROKE, '#FFF'),
+    labelBackgroundStroke: getColor(NODE_BORDER_COLOR, '#E9EAEB'),
+    labelBackgroundLineWidth: 1,
+    labelBackgroundRadius: DATA_MODE_ASSET_LABEL_BOX_RADIUS,
+    labelBackgroundWidth: boxW,
+    labelBackgroundHeight: boxH,
+    labelPadding: pad,
+  };
+};
+
+export function buildDataModeAssetNodeStyle(
+  getColor: (cssVar: string, fallback: string) => string,
+  label: string,
+  assetColor: string,
+  pos?: NodeStylePosition,
+  entityTypeLabel?: string,
+  entityIconUrl?: string
+): Record<string, unknown> {
+  const sz = DATA_MODE_ASSET_CIRCLE_SIZE;
+  const resolvedStroke = getColor(assetColor, '#e2e8f0');
+  const pad = DATA_MODE_ASSET_LABEL_BOX_PADDING;
+  const hPad = pad[1] + pad[3];
+  const vPad = pad[0] + pad[2];
+  const shadow = {
+    shadowColor: getColor(NODE_SHADOW_COLOR, NODE_SHADOW_COLOR_FALLBACK),
+    shadowBlur: NODE_SHADOW_BLUR,
+    shadowOffsetY: NODE_SHADOW_OFFSET_Y,
+  };
+
+  const keyShapeBase = {
+    size: [sz, sz],
+    fill: getColor(EDGE_LABEL_BG_STROKE, '#FFF'),
+    stroke: resolvedStroke,
+    lineWidth: DATA_MODE_ASSET_LINE_WIDTH,
+    radius: sz / 2,
+    icon: false,
+    ...shadow,
+    ...(pos && { x: pos.x, y: pos.y }),
+  };
+
+  const entityTypeText =
+    entityTypeLabel != null && String(entityTypeLabel).trim().length > 0
+      ? String(entityTypeLabel).trim()
+      : undefined;
+
+  const nameMeasureFont = `${DATA_MODE_ASSET_LABEL_FONT_WEIGHT} ${DATA_MODE_ASSET_LABEL_FONT_SIZE}px sans-serif`;
+
+  if (!entityTypeText) {
+    return buildAssetOnlyNodeStyle(
+      getColor,
+      label,
+      nameMeasureFont,
+      hPad,
+      vPad,
+      pad,
+      keyShapeBase
+    );
+  }
+
+  const entityTypeMeasureFont = `${DATA_MODE_ASSET_LABEL_FONT_WEIGHT} ${DATA_MODE_ENTITY_BADGE_FONT_SIZE}px sans-serif`;
+  const measuredEntityInner = measureCanvasTextWidthPx(
+    entityTypeText,
+    entityTypeMeasureFont,
+    'advance'
+  );
+  const entityInnerUncapped =
+    measuredEntityInner ??
+    Math.ceil(entityTypeText.length * DATA_MODE_ENTITY_TYPE_CHAR_WIDTH_EST);
+  const entityInnerW = Math.max(1, Math.ceil(entityInnerUncapped * 1.08));
+  const iconSectionW = entityIconUrl ? ENTITY_ICON_SECTION_W : 0;
+  const entityBoxW = entityIconUrl
+    ? iconSectionW +
+      DATA_MODE_ENTITY_ICON_TEXT_GAP +
+      entityInnerW +
+      DATA_MODE_ENTITY_ICON_RIGHT_PAD
+    : entityInnerW + DATA_MODE_ENTITY_BADGE_H_PAD * 2;
+  const entityBoxH =
+    DATA_MODE_ENTITY_BADGE_FONT_SIZE + DATA_MODE_ENTITY_BADGE_V_PAD * 2 + 4;
+
+  const insetH = DATA_MODE_ASSET_CARD_INSET_H;
+  const cardPadV = pad[0];
+  const gap = DATA_MODE_ASSET_NAME_ENTITY_GAP;
+  const cardOffsetY =
+    DATA_MODE_LABEL_OFFSET_Y + DATA_MODE_ASSET_CARD_CLEAR_BELOW_CIRCLE;
+
+  const nameContentWUncapped =
+    measureCanvasTextWidthPx(label, nameMeasureFont) ??
+    Math.ceil(label.length * DATA_MODE_ASSET_LABEL_CHAR_WIDTH_EST);
+  let nameMaxTextPx = Math.min(
+    DATA_MODE_ASSET_NAME_MAX_TEXT_WIDTH_PX,
+    Math.max(12, nameContentWUncapped)
+  );
+  let totalW = insetH * 2 + gap + entityBoxW + nameMaxTextPx;
+  totalW = Math.max(DATA_MODE_ASSET_LABEL_BOX_MIN_WIDTH, totalW);
+  totalW = Math.min(DATA_MODE_ASSET_ROW_MAX_WIDTH, totalW);
+  const nameAreaBudget = Math.max(12, totalW - insetH * 2 - gap - entityBoxW);
+  nameMaxTextPx = Math.min(nameMaxTextPx, nameAreaBudget);
+
+  const rowH = Math.max(
+    DATA_MODE_ASSET_LABEL_FONT_SIZE + cardPadV * 2 + 4,
+    entityBoxH
+  );
+
+  const nameSlotLeft = -totalW / 2 + insetH;
+  const entityCenterX = totalW / 2 - insetH - entityBoxW / 2;
+  const entityOffsetY =
+    cardOffsetY +
+    (rowH - entityBoxH) / 2 -
+    DATA_MODE_ENTITY_BADGE_VERTICAL_NUDGE_UP;
+
+  const cardShellBadge = {
+    text: '\u200b',
+    placement: 'bottom' as const,
+    offsetX: 0,
+    offsetY: cardOffsetY,
+    fontSize: DATA_MODE_ASSET_LABEL_FONT_SIZE,
+    fill: 'transparent',
+    background: true,
+    backgroundFill: getColor(EDGE_LABEL_BG_STROKE, '#FFF'),
+    backgroundStroke: getColor(NODE_BORDER_COLOR, '#E9EAEB'),
+    backgroundLineWidth: 1,
+    backgroundRadius: DATA_MODE_ASSET_LABEL_BOX_RADIUS,
+    backgroundWidth: totalW,
+    backgroundHeight: rowH,
+    padding: [0, 0, 0, 0],
+  };
+
+  const nameTruncateBudget = Math.max(12, nameMaxTextPx);
+  const nameLabel = truncateTextWithEllipsis(
+    label,
+    nameMeasureFont,
+    nameTruncateBudget
+  );
+
+  const nameBadge = {
+    text: nameLabel,
+    placement: 'bottom' as const,
+    offsetX: nameSlotLeft,
+    offsetY: cardOffsetY,
+    fontSize: DATA_MODE_ASSET_LABEL_FONT_SIZE,
+    fontWeight: DATA_MODE_ASSET_LABEL_FONT_WEIGHT,
+    fill: getColor(NODE_LABEL_FILL, NODE_LABEL_FILL_FALLBACK),
+    textAlign: 'left' as const,
+    wordWrap: false,
+    maxWidth: nameTruncateBudget,
+    maxLines: 1,
+    background: false,
+    padding: [cardPadV, 0, cardPadV, 0],
+  };
+
+  if (entityIconUrl) {
+    const pillLeftEdge = entityCenterX - entityBoxW / 2;
+    const entityTextLeft =
+      pillLeftEdge + iconSectionW + DATA_MODE_ENTITY_ICON_TEXT_GAP;
+    const pillTrimRight = DATA_MODE_ENTITY_PILL_TRIM_RIGHT_PX;
+    const entityPillDrawW = Math.max(1, entityBoxW - pillTrimRight);
+    const entityPillCenterX = entityCenterX - pillTrimRight / 2;
+
+    const entityPillBg = {
+      text: '\u200b',
+      placement: 'bottom' as const,
+      offsetX: entityPillCenterX,
+      offsetY: entityOffsetY,
+      fontSize: DATA_MODE_ENTITY_BADGE_FONT_SIZE,
+      fill: 'transparent',
+      background: true,
+      backgroundFill: getColor(EDGE_LABEL_BG_STROKE, '#FFF'),
+      backgroundStroke: getColor(
+        NODE_BORDER_COLOR,
+        DATA_MODE_ENTITY_BADGE_BORDER_FALLBACK
+      ),
+      backgroundLineWidth: 1,
+      backgroundRadius: DATA_MODE_ASSET_LABEL_BOX_RADIUS,
+      backgroundWidth: entityPillDrawW,
+      backgroundHeight: entityBoxH,
+      padding: [0, 0, 0, 0],
+    };
+
+    const entityTextMaxW = Math.max(1, entityInnerW - pillTrimRight);
+
+    const entityTextBadge = {
+      text: entityTypeText,
+      placement: 'bottom' as const,
+      offsetX: entityTextLeft,
+      offsetY: entityOffsetY,
+      fontSize: DATA_MODE_ENTITY_BADGE_FONT_SIZE,
+      fontWeight: DATA_MODE_ASSET_LABEL_FONT_WEIGHT,
+      fill: getColor(NODE_LABEL_FILL, NODE_LABEL_FILL_FALLBACK),
+      textAlign: 'left' as const,
+      background: false,
+      maxWidth: entityTextMaxW,
+      maxLines: 1,
+      wordWrap: false,
+      padding: [
+        DATA_MODE_ENTITY_BADGE_V_PAD,
+        0,
+        DATA_MODE_ENTITY_BADGE_V_PAD,
+        0,
+      ],
+    };
+
+    const entityIconX = pillLeftEdge + DATA_MODE_ENTITY_PILL_ICON_PAD_LEFT;
+    const entityIconY =
+      sz / 2 +
+      entityOffsetY -
+      DATA_MODE_ENTITY_PILL_ICON_SIZE / 2 -
+      DATA_MODE_ENTITY_PILL_ICON_NUDGE_UP;
+
+    return {
+      ...keyShapeBase,
+      label: false,
+      badge: true,
+      badgeZIndex: DATA_MODE_ASSET_BADGE_Z_INDEX,
+      badges: [cardShellBadge, nameBadge, entityPillBg, entityTextBadge],
+      entityIconSrc: entityIconUrl,
+      entityIconX,
+      entityIconY,
+    };
+  }
+
+  const entityBadge = {
+    text: entityTypeText,
+    placement: 'bottom' as const,
+    offsetX: entityCenterX,
+    offsetY: entityOffsetY,
+    fontSize: DATA_MODE_ENTITY_BADGE_FONT_SIZE,
+    fontWeight: DATA_MODE_ASSET_LABEL_FONT_WEIGHT,
+    fill: getColor(NODE_LABEL_FILL, NODE_LABEL_FILL_FALLBACK),
+    textAlign: 'center' as const,
+    wordWrap: false,
+    maxWidth: entityInnerW,
+    maxLines: 1,
+    textOverflow: '...',
+    background: true,
+    backgroundFill: getColor(EDGE_LABEL_BG_STROKE, '#FFF'),
+    backgroundStroke: getColor(
+      NODE_BORDER_COLOR,
+      DATA_MODE_ENTITY_BADGE_BORDER_FALLBACK
+    ),
+    backgroundLineWidth: 1,
+    backgroundRadius: DATA_MODE_ASSET_LABEL_BOX_RADIUS,
+    backgroundWidth: entityBoxW,
+    backgroundHeight: entityBoxH,
+    padding: [0, 0, 0, 0],
+  };
+
+  return {
+    ...keyShapeBase,
+    label: false,
+    badge: true,
+    badgeZIndex: DATA_MODE_ASSET_BADGE_Z_INDEX,
+    badges: [cardShellBadge, nameBadge, entityBadge],
+  };
+}
+
+export function buildDataModeTermNodeStyle(
+  getColor: (cssVar: string, fallback: string) => string,
+  label: string,
+  color: string,
+  pos?: NodeStylePosition
+): Record<string, unknown> {
+  const resolvedColor = getColor(color, '#3b82f6');
+
+  return {
+    size: [DATA_MODE_TERM_NODE_SIZE, DATA_MODE_TERM_NODE_SIZE],
+    fill: resolvedColor,
+    stroke: getColor(NODE_FILL_DEFAULT, '#ffffff'),
+    lineWidth: DATA_MODE_TERM_NODE_STROKE_WIDTH,
+    strokeOpacity: 1,
+    halo: true,
+    haloFill: 'rgba(255, 255, 255, 0)',
+    haloFillOpacity: 0,
+    haloLineWidth: DATA_MODE_TERM_HALO_LINE_WIDTH,
+    haloShadowBlur: DATA_MODE_TERM_HALO_SHADOW_BLUR,
+    haloShadowColor: getColor(
+      DATA_MODE_TERM_HALO_SHADOW_COLOR,
+      'rgba(203, 213, 225, 0.35)'
+    ),
+    haloStroke: getColor(DATA_MODE_TERM_HALO_STROKE, '#e8ecf0'),
+    haloStrokeOpacity: DATA_MODE_TERM_HALO_STROKE_OPACITY,
+    icon: false,
+    labelText: label,
+    labelFill: getColor(NODE_LABEL_FILL_INVERSE, '#ffffff'),
+    labelFontSize: NODE_LABEL_FONT_SIZE,
+    labelFontWeight: DATA_MODE_TERM_LABEL_FONT_WEIGHT,
+    labelPlacement: LABEL_PLACEMENT_BOTTOM,
+    labelOffsetY: DATA_MODE_LABEL_OFFSET_Y,
+    labelBackground: true,
+    labelBackgroundFill: resolvedColor,
+    labelBackgroundOpacity: 1,
+    labelBackgroundStroke: getColor(NODE_FILL_DEFAULT, '#ffffff'),
+    labelBackgroundLineWidth: DATA_MODE_TERM_NODE_STROKE_WIDTH,
+    labelBackgroundRadius: DATA_MODE_TERM_LABEL_BG_RADIUS,
+    labelBackgroundShadowBlur: DATA_MODE_TERM_LABEL_SHADOW_BLUR,
+    labelBackgroundShadowColor: getColor(
+      DATA_MODE_TERM_LABEL_SHADOW_COLOR,
+      'rgba(226, 232, 240, 0.65)'
+    ),
+    labelBackgroundShadowOffsetY: DATA_MODE_TERM_LABEL_SHADOW_OFFSET_Y,
+    labelPadding: TERM_LABEL_BG_PADDING,
+    shadowBlur: DATA_MODE_TERM_NODE_SHADOW_BLUR,
+    shadowColor: getColor(
+      DATA_MODE_TERM_NODE_SHADOW_COLOR,
+      'rgba(241, 245, 249, 0.92)'
+    ),
+    shadowOffsetY: DATA_MODE_TERM_NODE_SHADOW_OFFSET_Y,
+    ...(pos && { x: pos.x, y: pos.y }),
+  };
+}
+
+export function buildComboStyle(
+  labelText: string,
+  color: string,
+  extraVerticalPadding = 0,
+  getColor: (cssVar: string, fallback: string) => string = getCanvasColor
+): Record<string, unknown> {
+  const labelPx = measureTextWidth(
+    labelText,
+    COMBO_LABEL_MEASURE_FONT,
+    COMBO_LABEL_CHAR_WIDTH
+  );
+  const minWidth = labelPx + COMBO_LABEL_PADDING_LEFT * 2;
+
+  const NODE_ROW_HEIGHT = 36; // 2 × NODE_PADDING_V(9) + 18
+  const minHeight =
+    COMBO_INTERIOR_PADDING_TOP +
+    NODE_ROW_HEIGHT +
+    COMBO_INTERIOR_PADDING_SIDES +
+    extraVerticalPadding * 2;
+
+  return {
+    fill: getColor(COMBO_FILL_DEFAULT, '#ffffff'),
+    stroke: getColor(color, COMBO_COLOR_FALLBACK),
+    lineWidth: COMBO_LINE_WIDTH,
+    radius: COMBO_RADIUS,
+    padding: [
+      COMBO_INTERIOR_PADDING_TOP + extraVerticalPadding,
+      COMBO_INTERIOR_PADDING_SIDES,
+      COMBO_INTERIOR_PADDING_SIDES + extraVerticalPadding,
+      COMBO_INTERIOR_PADDING_SIDES,
+    ],
+    minHeight,
+    label: true,
+    labelText,
+    labelFill: getColor(color, COMBO_COLOR_FALLBACK),
+    labelFontSize: COMBO_LABEL_FONT_SIZE,
+    labelFontWeight: COMBO_LABEL_FONT_WEIGHT,
+    labelPlacement: LABEL_PLACEMENT_TOP_LEFT,
+    labelOffsetX: COMBO_LABEL_PADDING_LEFT,
+    labelOffsetY: COMBO_LABEL_PADDING_TOP_BOTTOM,
+    labelTextAlign: LABEL_TEXT_ALIGN_LEFT,
+    minWidth,
+  };
+}

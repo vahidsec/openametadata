@@ -1,0 +1,78 @@
+#  Copyright 2025 Collate
+#  Licensed under the Collate Community License, Version 1.0 (the "License");
+#  you may not use this file except in compliance with the License.
+#  You may obtain a copy of the License at
+#  https://github.com/open-metadata/OpenMetadata/blob/main/ingestion/LICENSE
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#  See the License for the specific language governing permissions and
+#  limitations under the License.
+"""
+Module containing the logic to delete a DAG
+"""
+
+import os
+from pathlib import Path
+
+from airflow.exceptions import DagNotFound
+from flask import Response
+
+try:
+    from airflow.api.common.delete_dag import delete_dag
+except ImportError:
+    from airflow.api.common.experimental.delete_dag import delete_dag
+
+from openmetadata_managed_apis.api.config import (
+    AIRFLOW_DAGS_FOLDER,
+    DAG_GENERATED_CONFIGS,
+)
+from openmetadata_managed_apis.api.response import ApiResponse
+from openmetadata_managed_apis.utils.logger import operations_logger
+
+logger = operations_logger()
+
+
+def delete_dag_id(dag_id: str) -> Response:
+    """
+    Delete a DAG dag_id from the filesystem and airflow db.
+    We clean:
+    - py file in AIRFLOW_DAGS_FOLDER
+    - config file in DAG_GENERATED_CONFIGS
+    - DagModel and DagRun entries in airflow db
+    :param dag_id: DAG to delete
+    :return: API Response
+    """
+
+    dag_py_file = Path(AIRFLOW_DAGS_FOLDER) / f"{dag_id}.py"
+    config_file = Path(DAG_GENERATED_CONFIGS) / f"{dag_id}.json"
+
+    deleted_file = False
+    if dag_py_file.is_file():
+        deleted_file = True
+        os.remove(dag_py_file.absolute())  # noqa: PTH107
+
+    deleted_config = False
+    if config_file.is_file():
+        deleted_config = True
+        os.remove(config_file.absolute())  # noqa: PTH107
+
+    # Airflow's own deletion walks every table keyed by the dag, in an order its foreign keys
+    # accept: a task instance pins the dag version it ran, so deleting the dag first is refused.
+    try:
+        delete_dag(dag_id)
+        deleted_dags = 1
+    except DagNotFound:
+        deleted_dags = 0
+
+    if deleted_dags > 0 and deleted_file and deleted_config:
+        return ApiResponse.success({"message": f"DAG [{dag_id}] has been deleted"})
+
+    logger.error(
+        "Could not fully delete DAG %s. Deleted database records: %s; DAG file: %s; config file: %s",
+        dag_id,
+        deleted_dags,
+        deleted_file,
+        deleted_config,
+    )
+    return ApiResponse.server_error()

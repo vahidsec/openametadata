@@ -1,0 +1,18 @@
+{
+  "$id": "https://open-metadata.org/schema/auth/tokenRefreshRequest.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TokenRefreshRequest",
+  "description": "This schema defines the Token Refresh Request",
+  "type": "object",
+  "javaType": "org.openmetadata.schema.auth.TokenRefreshRequest",
+  "properties": {
+    "refreshToken": {
+      "description": "Refresh Token that was shared earlier",
+      "type": "string"
+    }
+  },
+  "required": [
+    "refreshToken"
+  ],
+  "additionalProperties": false
+}

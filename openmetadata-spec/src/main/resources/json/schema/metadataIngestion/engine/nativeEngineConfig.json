@@ -1,0 +1,17 @@
+{
+"$id": "https://open-metadata.org/schema/metadataIngestion/engine/nativeEngineConfig.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Native Engine Configuration",
+  "description": "Configuration for the native metadata ingestion engine",
+  "type": "object",
+  "javaType": "org.openmetadata.schema.metadataIngestion.engine.NativeEngineConfig",
+  "properties": {
+    "type": {
+      "type": "string",
+      "enum": ["Native"],
+      "description": "The type of the engine configuration"
+    }
+  },
+  "required": ["type"],
+  "additionalProperties": false
+}

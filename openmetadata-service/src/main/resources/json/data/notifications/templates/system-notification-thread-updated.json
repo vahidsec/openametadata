@@ -1,0 +1,9 @@
+{
+  "name": "system-notification-thread-updated",
+  "fullyQualifiedName": "system-notification-thread-updated",
+  "displayName": "Conversation Updated Notification",
+  "description": "System default template for Conversation V2 update notifications",
+  "provider": "system",
+  "templateSubject": "[{{publisherName}}] - Change Event Update from {{emailingEntity}}",
+  "templateBody": "<strong>@{{event.userName}}</strong> updated a conversation for <strong>{{camelCaseToTitle entity.entityRef.type}}</strong> <a href=\"{{buildEntityUrl entity.entityRef.type entity.entityRef.fullyQualifiedName}}\">{{#if entity.entityRef.displayName}}{{entity.entityRef.displayName}}{{else}}{{entity.entityRef.fullyQualifiedName}}{{/if}}</a><br><br><blockquote>{{{processMentions entity.message}}}</blockquote>"
+}

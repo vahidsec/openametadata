@@ -1,0 +1,19 @@
+{
+  "$id": "https://open-metadata.org/schema/metadataIngestion/reverseingestionconfig/ownerConfig.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Reverse Ingestion Owner Config",
+  "type": "object",
+  "description": "Configuration for updating owners",
+  "javaType": "org.openmetadata.schema.metadataIngestion.reverseingestionconfig.ownerConfig",
+  "properties": {
+    "removedOwners": {
+      "description": "Removed owners from the entity",
+      "$ref": "../../type/entityReferenceList.json"
+    },
+    "addedOwners": {
+      "description": "Added owners to be applied",
+      "$ref": "../../type/entityReferenceList.json"
+    }
+  },
+  "additionalProperties": false
+}

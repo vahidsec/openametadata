@@ -1,0 +1,1414 @@
+/*
+ *  Copyright 2021 Collate
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+package org.openmetadata.it.bootstrap;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import es.co.elastic.clients.transport.rest5_client.low_level.Rest5Client;
+import es.co.elastic.clients.transport.rest5_client.low_level.Rest5ClientBuilder;
+import io.dropwizard.configuration.ConfigurationException;
+import io.dropwizard.configuration.EnvironmentVariableSubstitutor;
+import io.dropwizard.configuration.FileConfigurationSourceProvider;
+import io.dropwizard.configuration.SubstitutingSourceProvider;
+import io.dropwizard.configuration.YamlConfigurationFactory;
+import io.dropwizard.jackson.Jackson;
+import io.dropwizard.jersey.validation.Validators;
+import io.dropwizard.lifecycle.JettyManaged;
+import io.dropwizard.lifecycle.Managed;
+import io.dropwizard.testing.ResourceHelpers;
+import io.dropwizard.testing.junit5.DropwizardAppExtension;
+import jakarta.validation.Validator;
+import java.io.IOException;
+import java.lang.reflect.Field;
+import java.net.ServerSocket;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.TimeZone;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.hc.client5.http.auth.AuthScope;
+import org.apache.hc.client5.http.auth.UsernamePasswordCredentials;
+import org.apache.hc.client5.http.impl.auth.BasicCredentialsProvider;
+import org.apache.hc.core5.http.HttpHost;
+import org.jdbi.v3.core.Jdbi;
+import org.jdbi.v3.sqlobject.SqlObjectPlugin;
+import org.jdbi.v3.sqlobject.SqlObjects;
+import org.junit.platform.launcher.LauncherSession;
+import org.junit.platform.launcher.LauncherSessionListener;
+import org.openmetadata.it.util.SdkClients;
+import org.openmetadata.schema.api.configuration.pipelineServiceClient.Parameters;
+import org.openmetadata.schema.api.configuration.pipelineServiceClient.PipelineServiceClientConfiguration;
+import org.openmetadata.schema.api.configuration.rdf.RdfConfiguration;
+import org.openmetadata.schema.service.configuration.elasticsearch.ElasticSearchConfiguration;
+import org.openmetadata.schema.type.IndexMappingLanguage;
+import org.openmetadata.search.IndexMappingLoader;
+import org.openmetadata.service.Entity;
+import org.openmetadata.service.OpenMetadataApplication;
+import org.openmetadata.service.OpenMetadataApplicationConfig;
+import org.openmetadata.service.apps.ApplicationContext;
+import org.openmetadata.service.apps.ApplicationHandler;
+import org.openmetadata.service.events.AuditExcludeFilterFactory;
+import org.openmetadata.service.events.AuditOnlyFilterFactory;
+import org.openmetadata.service.governance.workflows.WorkflowHandler;
+import org.openmetadata.service.jdbi3.CollectionDAO;
+import org.openmetadata.service.jdbi3.HikariCPDataSourceFactory;
+import org.openmetadata.service.jdbi3.locator.ConnectionAwareAnnotationSqlLocator;
+import org.openmetadata.service.jdbi3.locator.ConnectionType;
+import org.openmetadata.service.jobs.JobDAO;
+import org.openmetadata.service.logging.SwitchableAccessLayoutFactory;
+import org.openmetadata.service.logging.SwitchableEventLayoutFactory;
+import org.openmetadata.service.migration.api.MigrationWorkflow;
+import org.openmetadata.service.resources.CollectionRegistry;
+import org.openmetadata.service.resources.databases.DatasourceConfig;
+import org.openmetadata.service.resources.services.ingestionpipelines.IngestionPipelineResource;
+import org.openmetadata.service.resources.settings.SettingsCache;
+import org.openmetadata.service.search.SearchRepository;
+import org.openmetadata.service.search.SearchRepositoryFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.JdbcDatabaseContainer;
+import org.testcontainers.containers.MySQLContainer;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.containers.wait.strategy.LogMessageWaitStrategy;
+import org.testcontainers.containers.wait.strategy.Wait;
+import org.testcontainers.elasticsearch.ElasticsearchContainer;
+import org.testcontainers.images.builder.ImageFromDockerfile;
+import org.testcontainers.k3s.K3sContainer;
+import org.testcontainers.utility.DockerImageName;
+
+/**
+ * JUnit 5 LauncherSessionListener that starts all test infrastructure (database, Elasticsearch,
+ * OpenMetadata application) ONCE per test session and shares them across all IT test classes.
+ *
+ * <p>This enables parallel test execution by:
+ * 1. Starting containers only once (not per test class)
+ * 2. Sharing the same application instance across all tests
+ * 3. Using TestNamespace for entity name isolation
+ */
+public class TestSuiteBootstrap implements LauncherSessionListener {
+
+  private static final Logger LOG = LoggerFactory.getLogger(TestSuiteBootstrap.class);
+  private static final AtomicBoolean STARTED = new AtomicBoolean(false);
+  private static final String CONFIG_PATH =
+      ResourceHelpers.resourceFilePath("openmetadata-secure-test.yaml");
+
+  private static final String ELASTIC_USER = "elastic";
+  private static final String ELASTIC_PASSWORD = "password";
+  private static final String ELASTIC_SCHEME = "http";
+  private static final Integer ELASTIC_CONNECT_TIMEOUT = 5;
+  private static final Integer ELASTIC_SOCKET_TIMEOUT = 60;
+  private static final Integer ELASTIC_KEEP_ALIVE_TIMEOUT = 600;
+  private static final Integer ELASTIC_BATCH_SIZE = 10;
+  private static final IndexMappingLanguage ELASTIC_SEARCH_INDEX_MAPPING_LANGUAGE =
+      IndexMappingLanguage.EN;
+  private static final String ELASTIC_SEARCH_CLUSTER_ALIAS = "openmetadata";
+
+  // Default images (can be overridden by system properties)
+  private static final String DEFAULT_POSTGRES_IMAGE = "postgres:15";
+  private static final String DEFAULT_MYSQL_IMAGE = "mysql:8.3.0";
+  private static final String DEFAULT_MYSQL_MAX_ALLOWED_PACKET = "64M";
+  private static final String DEFAULT_ELASTICSEARCH_IMAGE =
+      "docker.elastic.co/elasticsearch/elasticsearch:9.3.0";
+  private static final String DEFAULT_OPENSEARCH_IMAGE = "opensearchproject/opensearch:3.4.0";
+
+  private static final String RDF_CONTAINER_IMAGE_PROPERTY = "rdfContainerImage";
+  private static final String RDF_CONTAINER_TMPFS_SIZE_PROPERTY = "rdfContainerTmpfsSize";
+  // Three TDB2 datasets and compaction generations exceed the old single-dataset 256 MiB cap.
+  private static final String DEFAULT_FUSEKI_TMPFS_SIZE = "8g";
+  private static final int FUSEKI_PORT = 3030;
+  private static final String FUSEKI_DATASET = "openmetadata";
+  private static final String FUSEKI_ADMIN_PASSWORD = "test-admin";
+
+  // K3s (Kubernetes) configuration for pipeline scheduler tests (on-demand)
+  private static final String K3S_IMAGE = "rancher/k3s:v1.27.4-k3s1";
+  private static final String K8S_NAMESPACE = "openmetadata-pipelines";
+
+  // Database and search configuration (read from system properties)
+  private static String databaseType;
+  private static String searchType;
+  private static boolean rdfEnabled;
+  private static String cacheProvider;
+
+  private static JdbcDatabaseContainer<?> DATABASE_CONTAINER;
+  private static GenericContainer<?> SEARCH_CONTAINER;
+  private static GenericContainer<?> FUSEKI_CONTAINER;
+  private static GenericContainer<?> REDIS_CONTAINER;
+  private static K3sContainer K3S_CONTAINER;
+  private static GenericContainer<?> OBJECT_STORAGE_CONTAINER;
+  private static DropwizardAppExtension<OpenMetadataApplicationConfig> APP;
+  private static final List<DropwizardAppExtension<OpenMetadataApplicationConfig>> ADDITIONAL_APPS =
+      java.util.Collections.synchronizedList(new ArrayList<>());
+  private static Jdbi jdbi;
+
+  private static String searchHost;
+  private static int searchPort;
+  private static String fusekiEndpoint;
+  private static String kubeConfigYaml;
+  private static String redisUrl;
+  private static String redisKeyspace;
+
+  private static final String DEFAULT_REDIS_IMAGE = "redis:7-alpine";
+  private static final int REDIS_PORT = 6379;
+
+  @Override
+  public void launcherSessionOpened(LauncherSession session) {
+    if (isEmbeddedBootstrapDisabled()) {
+      LOG.info(
+          "TestSuiteBootstrap: skipping embedded boot (JPW_MODE={} or skip.embedded.bootstrap=true)",
+          resolveJpwMode());
+      return;
+    }
+    if (!STARTED.compareAndSet(false, true)) {
+      LOG.info("TestSuiteBootstrap already started, skipping initialization");
+      return;
+    }
+
+    // Read configuration from system properties
+    databaseType = System.getProperty("databaseType", "postgres");
+    searchType = System.getProperty("searchType", "elasticsearch");
+    rdfEnabled = Boolean.parseBoolean(System.getProperty("enableRdf", "false"));
+    cacheProvider = System.getProperty("cacheProvider", "none");
+
+    // The test-support search resource is disabled by default (it must never ship enabled in
+    // production); the embedded test server opts in so the resource is available to tests.
+    System.setProperty("OM_TEST_SUPPORT_SEARCH_ENABLED", "true");
+
+    LOG.info("=== TestSuiteBootstrap: Starting test infrastructure ===");
+    System.setProperty("user.timezone", "UTC");
+    TimeZone.setDefault(TimeZone.getTimeZone("UTC"));
+    LOG.info("Test JVM timezone set to {}", TimeZone.getDefault().getID());
+    LOG.info("Database type: {}", databaseType);
+    LOG.info("Search type: {}", searchType);
+    LOG.info("RDF enabled: {}", rdfEnabled);
+    LOG.info("Cache provider: {}", cacheProvider);
+    boolean k8sEnabled = isK8sTestsRequested();
+    LOG.info("K8s tests enabled: {}", k8sEnabled);
+    long startTime = System.currentTimeMillis();
+
+    try {
+      startDatabase();
+      startSearch();
+      if (rdfEnabled) {
+        startFuseki();
+      }
+      if (isRedisEnabled()) {
+        startRedis();
+      }
+      if (k8sEnabled) {
+        startK3s();
+      }
+      startApplication();
+
+      long duration = System.currentTimeMillis() - startTime;
+      LOG.info("=== TestSuiteBootstrap: Infrastructure started in {}ms ===", duration);
+      LOG.info("Database ({}): {}", databaseType, DATABASE_CONTAINER.getJdbcUrl());
+      LOG.info("Search ({}): {}:{}", searchType, searchHost, searchPort);
+      if (rdfEnabled) {
+        LOG.info("Fuseki SPARQL: {}", fusekiEndpoint);
+      }
+      if (isRedisEnabled()) {
+        LOG.info("Redis: {}", redisUrl);
+      }
+      if (k8sEnabled) {
+        LOG.info("K3s Kubernetes: enabled");
+      }
+      LOG.info("OpenMetadata: http://localhost:{}", APP.getLocalPort());
+
+      System.setProperty("IT_BASE_URL", "http://localhost:" + APP.getLocalPort() + "/api");
+
+      SharedEntities.initialize(SdkClients.adminClient());
+
+    } catch (Exception e) {
+      LOG.error("Failed to start test infrastructure", e);
+      cleanup();
+      throw new RuntimeException("TestSuiteBootstrap initialization failed", e);
+    }
+  }
+
+  @Override
+  public void launcherSessionClosed(LauncherSession session) {
+    if (isEmbeddedBootstrapDisabled()) {
+      return;
+    }
+    LOG.info("=== TestSuiteBootstrap: Shutting down test infrastructure ===");
+    cleanup();
+  }
+
+  private static boolean isEmbeddedBootstrapDisabled() {
+    return "external".equalsIgnoreCase(resolveJpwMode())
+        || Boolean.parseBoolean(System.getProperty("skip.embedded.bootstrap", "false"));
+  }
+
+  private static String resolveJpwMode() {
+    final String fromProp = System.getProperty("JPW_MODE");
+    if (fromProp != null && !fromProp.isBlank()) {
+      return fromProp;
+    }
+    final String fromEnv = System.getenv("JPW_MODE");
+    return fromEnv != null ? fromEnv : "";
+  }
+
+  private void startDatabase() {
+    String image = System.getProperty("databaseImage");
+
+    if ("mysql".equalsIgnoreCase(databaseType)) {
+      if (image == null) {
+        image = DEFAULT_MYSQL_IMAGE;
+      }
+      LOG.info("Starting MySQL container with image: {}", image);
+      String mysqlMaxAllowedPacket =
+          System.getProperty("mysqlMaxAllowedPacket", DEFAULT_MYSQL_MAX_ALLOWED_PACKET);
+      MySQLContainer<?> mysql = new MySQLContainer<>(image);
+      mysql.withDatabaseName("openmetadata");
+      mysql.withUsername("test");
+      mysql.withPassword("test");
+      mysql.withCommand(
+          "mysqld",
+          "--max_allowed_packet=" + mysqlMaxAllowedPacket,
+          // The tag list query (TagDAO.listAfter) joins three tables and sorts by tag.name,
+          // tag.id; under the parallel-tests fork the tag table grows large and the default
+          // 256KB sort_buffer_size overflows with "Out of sort memory" (#27649). 8MB is plenty
+          // for an integration-test workload and well under the 4GB overall limit.
+          "--sort_buffer_size=8M");
+      mysql.withStartupTimeoutSeconds(240);
+      mysql.withConnectTimeoutSeconds(240);
+      if (Boolean.parseBoolean(System.getProperty("dbContainerTmpfs", "true"))) {
+        mysql.withTmpFs(java.util.Map.of("/var/lib/mysql", "rw,size=2g"));
+      }
+      mysql.withCreateContainerCmdModifier(
+          cmd ->
+              cmd.getHostConfig()
+                  .withUlimits(
+                      java.util.List.of(
+                          new com.github.dockerjava.api.model.Ulimit("nofile", 65536L, 65536L))));
+      mysql.start();
+      DATABASE_CONTAINER = mysql;
+      LOG.info(
+          "MySQL started: {} (max_allowed_packet={})",
+          DATABASE_CONTAINER.getJdbcUrl(),
+          mysqlMaxAllowedPacket);
+    } else {
+      if (image == null) {
+        image = DEFAULT_POSTGRES_IMAGE;
+      }
+      LOG.info("Starting PostgreSQL container with image: {}", image);
+      PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(image);
+      postgres.withDatabaseName("openmetadata");
+      postgres.withUsername("test");
+      postgres.withPassword("test");
+      postgres.withStartupTimeoutSeconds(240);
+      postgres.withConnectTimeoutSeconds(240);
+      String durability =
+          Boolean.parseBoolean(System.getProperty("dbDurable", "false")) ? "on" : "off";
+      LOG.info("PostgreSQL durability (fsync/synchronous_commit/full_page_writes)={}", durability);
+      postgres.withCommand(
+          "postgres",
+          "-c",
+          "max_wal_size=512MB",
+          "-c",
+          "min_wal_size=64MB",
+          "-c",
+          "wal_level=minimal",
+          "-c",
+          "max_wal_senders=0",
+          "-c",
+          "checkpoint_completion_target=0.5",
+          "-c",
+          "checkpoint_timeout=30s",
+          "-c",
+          "shared_buffers=128MB",
+          "-c",
+          "fsync=" + durability,
+          "-c",
+          "synchronous_commit=" + durability,
+          "-c",
+          "full_page_writes=" + durability,
+          // Bump work_mem for the same reason MySQL gets a larger sort_buffer above:
+          // TagDAO.listAfter joins three tables and sorts; default 4MB spills to temp files
+          // under load.
+          "-c",
+          "work_mem=32MB");
+      if (Boolean.parseBoolean(System.getProperty("dbContainerTmpfs", "true"))) {
+        postgres.withTmpFs(java.util.Map.of("/var/lib/postgresql/data", "rw,size=2g"));
+      }
+      postgres.withCreateContainerCmdModifier(
+          cmd -> {
+            final long memory = Long.getLong("dbContainerMemoryBytes", 0L);
+            final long nanoCpus = Long.getLong("dbContainerNanoCpus", 0L);
+            if (memory > 0) cmd.getHostConfig().withMemory(memory);
+            if (nanoCpus > 0) cmd.getHostConfig().withNanoCPUs(nanoCpus);
+          });
+      postgres.withCreateContainerCmdModifier(
+          cmd ->
+              cmd.getHostConfig()
+                  .withUlimits(
+                      java.util.List.of(
+                          new com.github.dockerjava.api.model.Ulimit("nofile", 65536L, 65536L))));
+      postgres.start();
+      DATABASE_CONTAINER = postgres;
+      LOG.info("PostgreSQL started: {}", DATABASE_CONTAINER.getJdbcUrl());
+    }
+  }
+
+  private void startSearch() {
+    String image = System.getProperty("searchImage");
+
+    if ("opensearch".equalsIgnoreCase(searchType)) {
+      if (image == null) {
+        image = DEFAULT_OPENSEARCH_IMAGE;
+      }
+      LOG.info("Starting OpenSearch container with image: {}", image);
+
+      org.opensearch.testcontainers.OpensearchContainer<?> opensearch =
+          new org.opensearch.testcontainers.OpensearchContainer<>(image);
+      opensearch.withEnv("discovery.type", "single-node");
+      opensearch.withEnv("DISABLE_SECURITY_PLUGIN", "true");
+      opensearch.withEnv("DISABLE_INSTALL_DEMO_CONFIG", "true");
+      // The search-it suite reindexes the full shared catalog on every test (beforeEach recreate),
+      // and heavy-seed tests (ReindexStopUnderLoadIT seeds 10k tables) leave thousands of entities
+      // in the DB that every later recreate re-indexes. With only 1g heap / 1g tmpfs the
+      // single-node
+      // engine saturates and live-index writes block until the 60s socket timeout, cascading
+      // failures
+      // into whichever test runs next. 2g heap + 2g tmpfs gives the headroom to absorb that load.
+      opensearch.withEnv("OPENSEARCH_JAVA_OPTS", "-Xms2g -Xmx2g");
+      opensearch.withStartupAttempts(3);
+      opensearch.withTmpFs(
+          java.util.Map.of("/usr/share/opensearch/data", "rw,size=2g,uid=1000,gid=1000"));
+      opensearch.withCreateContainerCmdModifier(
+          cmd ->
+              cmd.getHostConfig()
+                  .withUlimits(
+                      java.util.List.of(
+                          new com.github.dockerjava.api.model.Ulimit("nofile", 65536L, 65536L))));
+      opensearch.start();
+      SEARCH_CONTAINER = opensearch;
+
+      searchHost = opensearch.getHost();
+      searchPort = opensearch.getMappedPort(9200);
+      LOG.info("OpenSearch started: {}:{}", searchHost, searchPort);
+    } else {
+      if (image == null) {
+        image = DEFAULT_ELASTICSEARCH_IMAGE;
+      }
+      LOG.info("Starting Elasticsearch container with image: {}", image);
+
+      ElasticsearchContainer elasticsearch = new ElasticsearchContainer(image);
+      elasticsearch.withPassword(ELASTIC_PASSWORD);
+      elasticsearch.withEnv("discovery.type", "single-node");
+      elasticsearch.withEnv("xpack.security.enabled", "false");
+      elasticsearch.withEnv("ES_JAVA_OPTS", "-Xms1g -Xmx1g");
+      elasticsearch.withStartupAttempts(3);
+      elasticsearch.withTmpFs(java.util.Map.of("/usr/share/elasticsearch/data", "rw,size=1g"));
+      elasticsearch.setWaitStrategy(
+          new LogMessageWaitStrategy()
+              .withRegEx(".*(\"message\":\\s?\"started[\\s?|\"].*|] started\n$)")
+              .withStartupTimeout(Duration.ofMinutes(5)));
+      elasticsearch.withCreateContainerCmdModifier(
+          cmd ->
+              cmd.getHostConfig()
+                  .withUlimits(
+                      java.util.List.of(
+                          new com.github.dockerjava.api.model.Ulimit("nofile", 65536L, 65536L))));
+      elasticsearch.start();
+      SEARCH_CONTAINER = elasticsearch;
+
+      searchHost = elasticsearch.getHost();
+      searchPort = elasticsearch.getMappedPort(9200);
+      LOG.info("Elasticsearch started: {}:{}", searchHost, searchPort);
+    }
+  }
+
+  private void startRedis() {
+    String image = System.getProperty("redisImage", DEFAULT_REDIS_IMAGE);
+    LOG.info("Starting Redis container with image: {}", image);
+    REDIS_CONTAINER =
+        new GenericContainer<>(DockerImageName.parse(image))
+            .withExposedPorts(REDIS_PORT)
+            .withCommand(
+                "redis-server",
+                "--appendonly",
+                "no",
+                "--save",
+                "",
+                "--maxmemory",
+                "512mb",
+                "--maxmemory-policy",
+                "allkeys-lru")
+            .waitingFor(Wait.forListeningPort().withStartupTimeout(Duration.ofMinutes(1)));
+    REDIS_CONTAINER.start();
+    redisUrl =
+        String.format(
+            "redis://%s:%d", REDIS_CONTAINER.getHost(), REDIS_CONTAINER.getMappedPort(REDIS_PORT));
+    redisKeyspace = "om:it:" + System.currentTimeMillis();
+    LOG.info("Redis started: {}", redisUrl);
+  }
+
+  public static boolean isRedisEnabled() {
+    return "redis".equalsIgnoreCase(cacheProvider);
+  }
+
+  public static String getRedisUrl() {
+    return redisUrl;
+  }
+
+  private static void configureCache(OpenMetadataApplicationConfig config) {
+    if (!isRedisEnabled()) {
+      return;
+    }
+    org.openmetadata.service.cache.CacheConfig cacheConfig = config.getCacheConfig();
+    cacheConfig.provider = org.openmetadata.service.cache.CacheConfig.Provider.redis;
+    cacheConfig.redis.url = redisUrl;
+    cacheConfig.redis.authType = org.openmetadata.service.cache.CacheConfig.AuthType.NONE;
+    cacheConfig.redis.keyspace = redisKeyspace;
+    cacheConfig.redis.commandTimeoutMs = 1000;
+    cacheConfig.entityTtlSeconds = 3600;
+    cacheConfig.relationshipTtlSeconds = 3600;
+    cacheConfig.tagTtlSeconds = 3600;
+    config.setCacheConfig(cacheConfig);
+    LOG.info(
+        "Configured Redis cache: url={} keyspace={}",
+        cacheConfig.redis.url,
+        cacheConfig.redis.keyspace);
+  }
+
+  private static String fusekiTmpfsSize() {
+    return System.getProperty(RDF_CONTAINER_TMPFS_SIZE_PROPERTY, DEFAULT_FUSEKI_TMPFS_SIZE);
+  }
+
+  private void startFuseki() {
+    LOG.info("Starting the configured OpenMetadata Fuseki image...");
+    FUSEKI_CONTAINER = createFusekiContainer();
+    FUSEKI_CONTAINER.start();
+
+    fusekiEndpoint =
+        String.format(
+            "http://%s:%d/%s",
+            FUSEKI_CONTAINER.getHost(),
+            FUSEKI_CONTAINER.getMappedPort(FUSEKI_PORT),
+            FUSEKI_DATASET);
+    LOG.info("Fuseki started: {}", fusekiEndpoint);
+  }
+
+  /** Creates an isolated Fuseki instance with the server's assembler and write extension. */
+  public static GenericContainer<?> createFusekiContainer() {
+    final GenericContainer<?> container =
+        fusekiContainer()
+            .withExposedPorts(FUSEKI_PORT)
+            .withEnv("ADMIN_PASSWORD", FUSEKI_ADMIN_PASSWORD)
+            .withEnv("FUSEKI_ADMIN_PASSWORD", FUSEKI_ADMIN_PASSWORD)
+            .withEnv("JVM_ARGS", System.getProperty("rdfContainerJvmArgs", "-Xms512m -Xmx512m"))
+            .waitingFor(
+                Wait.forHttp("/$/ping")
+                    .forPort(FUSEKI_PORT)
+                    .forStatusCode(200)
+                    .withStartupTimeout(Duration.ofMinutes(2)))
+            // Increase file descriptor limits for parallel test execution
+            .withCreateContainerCmdModifier(
+                cmd ->
+                    cmd.getHostConfig()
+                        .withUlimits(
+                            java.util.List.of(
+                                new com.github.dockerjava.api.model.Ulimit(
+                                    "nofile", 65536L, 65536L))));
+    if (Boolean.parseBoolean(System.getProperty("rdfContainerTmpfs", "true"))) {
+      // Scale runs opt out so disk and page-cache measurements describe persistent TDB2 storage.
+      container.withTmpFs(
+          Map.of(
+              "/fuseki/databases", "rw,size=" + fusekiTmpfsSize() + ",mode=1777",
+              "/fuseki-data", "rw,size=" + fusekiTmpfsSize() + ",mode=1777"));
+    }
+    if (Boolean.getBoolean("rdfContainerStablePort")) {
+      // Docker can allocate a different ephemeral host port on restart.
+      try (ServerSocket socket = new ServerSocket(Integer.getInteger("rdfContainerHostPort", 0))) {
+        container.setPortBindings(List.of(socket.getLocalPort() + ":" + FUSEKI_PORT));
+      } catch (IOException exception) {
+        throw new IllegalStateException("Cannot reserve a stable Fuseki test port", exception);
+      }
+    }
+    final long memoryBytes = Long.getLong("rdfContainerMemoryBytes", 0L);
+    final long nanoCpus = Long.getLong("rdfContainerNanoCpus", 0L);
+    container.withCreateContainerCmdModifier(
+        cmd -> {
+          if (memoryBytes > 0) cmd.getHostConfig().withMemory(memoryBytes);
+          if (nanoCpus > 0) cmd.getHostConfig().withNanoCPUs(nanoCpus);
+        });
+    return container;
+  }
+
+  /** The isolated test container, for scale sampling and restart verification. */
+  public static GenericContainer<?> getFusekiContainer() {
+    return FUSEKI_CONTAINER;
+  }
+
+  /** The isolated metadata database, for scale resource sampling. */
+  public static GenericContainer<?> getDatabaseContainer() {
+    return DATABASE_CONTAINER;
+  }
+
+  private static GenericContainer<?> fusekiContainer() {
+    final String image = System.getProperty(RDF_CONTAINER_IMAGE_PROPERTY);
+    if (image != null && !image.isBlank()) {
+      return new GenericContainer<>(DockerImageName.parse(image));
+    }
+    return new GenericContainer<>(
+        new ImageFromDockerfile()
+            .withFileFromPath(".", Paths.get(getProjectRoot(), "docker", "rdf-store")));
+  }
+
+  private void startK3s() {
+    LOG.info("Starting K3s (Kubernetes) container for pipeline scheduler tests...");
+
+    // Reset any existing pipeline client
+    org.openmetadata.service.clients.pipeline.PipelineServiceClientFactory.reset();
+
+    K3S_CONTAINER = new K3sContainer(DockerImageName.parse(K3S_IMAGE));
+    K3S_CONTAINER.start();
+    kubeConfigYaml = K3S_CONTAINER.getKubeConfigYaml();
+    LOG.info("K3s container started");
+
+    // Create namespace for pipelines
+    try {
+      io.kubernetes.client.openapi.ApiClient apiClient =
+          io.kubernetes.client.util.Config.fromConfig(new java.io.StringReader(kubeConfigYaml));
+      apiClient.setReadTimeout(30000);
+      apiClient.setConnectTimeout(10000);
+
+      io.kubernetes.client.openapi.apis.CoreV1Api coreApi =
+          new io.kubernetes.client.openapi.apis.CoreV1Api(apiClient);
+      io.kubernetes.client.openapi.models.V1Namespace namespace =
+          new io.kubernetes.client.openapi.models.V1Namespace()
+              .metadata(new io.kubernetes.client.openapi.models.V1ObjectMeta().name(K8S_NAMESPACE));
+      coreApi.createNamespace(namespace).execute();
+      LOG.info("Created K8s namespace: {}", K8S_NAMESPACE);
+    } catch (Exception e) {
+      LOG.warn("Failed to create K8s namespace (may already exist): {}", e.getMessage());
+    }
+  }
+
+  public static boolean isK8sTestsRequested() {
+    return "true".equalsIgnoreCase(System.getProperty("ENABLE_K8S_TESTS"))
+        || "true".equalsIgnoreCase(System.getenv("ENABLE_K8S_TESTS"));
+  }
+
+  private void startApplication() throws Exception {
+    LOG.info("Starting OpenMetadata application...");
+    OpenMetadataApplicationConfig config = buildRuntimeApplicationConfig();
+    String projectRoot = getProjectRoot();
+    String flyWayMigrationScriptsLocation = getFlywayMigrationScriptsLocation(projectRoot);
+    String nativeMigrationScriptsLocation = getNativeMigrationScriptsLocation(projectRoot);
+
+    IndexMappingLoader.init(getSearchConfig());
+
+    APP = new DropwizardAppExtension<>(OpenMetadataApplication.class, config);
+
+    jdbi =
+        Jdbi.create(
+            DATABASE_CONTAINER.getJdbcUrl(),
+            DATABASE_CONTAINER.getUsername(),
+            DATABASE_CONTAINER.getPassword());
+    jdbi.installPlugin(new SqlObjectPlugin());
+    jdbi.getConfig(SqlObjects.class)
+        .setSqlLocator(
+            new ConnectionAwareAnnotationSqlLocator(DATABASE_CONTAINER.getDriverClassName()));
+
+    validateAndRunSystemDataMigrations(
+        jdbi,
+        config,
+        ConnectionType.from(DATABASE_CONTAINER.getDriverClassName()),
+        nativeMigrationScriptsLocation,
+        "",
+        flyWayMigrationScriptsLocation,
+        false);
+
+    createIndices();
+
+    // Start object storage before app boot if it is configured to use S3 so that the
+    // S3AssetService picks up the correct endpoint.
+    if (config.getObjectStorage() != null
+        && config.getObjectStorage().isEnabled()
+        && "s3".equalsIgnoreCase(config.getObjectStorage().getProvider())) {
+      setupObjectStorage();
+      if (config.getObjectStorage().getS3Configuration() != null) {
+        config.getObjectStorage().getS3Configuration().setEndpoint(getObjectStorageEndpoint());
+      }
+    }
+
+    // Start the application
+    APP.before();
+
+    // Load seed data
+    try {
+      CollectionRegistry.getInstance().loadSeedData(jdbi, config, null, null, null, true);
+    } catch (Exception se) {
+      LOG.warn("Seed data load failed: {}", se.getMessage());
+    }
+
+    registerMcpServerIfAvailable();
+
+    LOG.info("OpenMetadata application started on port {}", APP.getLocalPort());
+  }
+
+  private void registerMcpServerIfAvailable() {
+    try {
+      // ApplicationContext was initialized before seed data loaded, so it missed McpApplication.
+      // Reinitialize to pick up apps created by seed data loading.
+      ApplicationContext.reinitialize();
+
+      if (ApplicationContext.getInstance().getAppIfExists("McpApplication") == null) {
+        LOG.info("McpApplication not found, skipping MCP server registration");
+        return;
+      }
+
+      // registerMCPServer is protected, so we use reflection from the test bootstrap
+      OpenMetadataApplication application = (OpenMetadataApplication) APP.getApplication();
+      java.lang.reflect.Method method =
+          OpenMetadataApplication.class.getDeclaredMethod(
+              "registerMCPServer",
+              OpenMetadataApplicationConfig.class,
+              io.dropwizard.core.setup.Environment.class);
+      method.setAccessible(true);
+      method.invoke(application, APP.getConfiguration(), APP.getEnvironment());
+      LOG.info("MCP server registered successfully");
+    } catch (Exception e) {
+      LOG.info("MCP server registration skipped: {}", e.getMessage());
+    }
+  }
+
+  private static OpenMetadataApplicationConfig readTestAppConfig(String path)
+      throws ConfigurationException, IOException {
+    ObjectMapper objectMapper = Jackson.newObjectMapper();
+    objectMapper.registerSubtypes(
+        AuditExcludeFilterFactory.class,
+        AuditOnlyFilterFactory.class,
+        SwitchableEventLayoutFactory.class,
+        SwitchableAccessLayoutFactory.class);
+    Validator validator = Validators.newValidator();
+    YamlConfigurationFactory<OpenMetadataApplicationConfig> factory =
+        new YamlConfigurationFactory<>(
+            OpenMetadataApplicationConfig.class, validator, objectMapper, "dw");
+    return factory.build(
+        new SubstitutingSourceProvider(
+            new FileConfigurationSourceProvider(), new EnvironmentVariableSubstitutor(false)),
+        path);
+  }
+
+  private void validateAndRunSystemDataMigrations(
+      Jdbi jdbi,
+      OpenMetadataApplicationConfig config,
+      ConnectionType connType,
+      String nativeMigrationSQLPath,
+      String extensionSQLScriptRootPath,
+      String flywayPath,
+      boolean forceMigrations) {
+    DatasourceConfig.initialize(connType.label);
+    MigrationWorkflow workflow =
+        new MigrationWorkflow(
+            jdbi,
+            nativeMigrationSQLPath,
+            connType,
+            extensionSQLScriptRootPath,
+            flywayPath,
+            config,
+            forceMigrations);
+    SearchRepository searchRepository = new SearchRepository(getSearchConfig(), 50);
+    Entity.setSearchRepository(searchRepository);
+    Entity.setCollectionDAO(jdbi.onDemand(CollectionDAO.class));
+    Entity.setJobDAO(jdbi.onDemand(JobDAO.class));
+    Entity.setJdbi(jdbi);
+    Entity.initializeRepositories(config, jdbi);
+    workflow.loadMigrations();
+    workflow.runMigrationWorkflows(false);
+    WorkflowHandler.initialize(config);
+    SettingsCache.initialize(config);
+    ApplicationHandler.initialize(config);
+    ApplicationContext.initialize();
+    Entity.cleanup();
+  }
+
+  private void createIndices() {
+    ElasticSearchConfiguration config = getSearchConfig();
+    SearchRepository searchRepository = SearchRepositoryFactory.createSearchRepository(config, 50);
+    Entity.setSearchRepository(searchRepository);
+    LOG.info("Creating {} indexes...", searchType);
+    searchRepository.createIndexes();
+    searchRepository.createOrUpdateIndexTemplates();
+  }
+
+  private static ElasticSearchConfiguration getSearchConfig() {
+    ElasticSearchConfiguration config = new ElasticSearchConfiguration();
+    ElasticSearchConfiguration.SearchType type =
+        "opensearch".equalsIgnoreCase(searchType)
+            ? ElasticSearchConfiguration.SearchType.OPENSEARCH
+            : ElasticSearchConfiguration.SearchType.ELASTICSEARCH;
+    config
+        .withHost(searchHost)
+        .withPort(searchPort)
+        .withUsername(ELASTIC_USER)
+        .withPassword(ELASTIC_PASSWORD)
+        .withScheme(ELASTIC_SCHEME)
+        .withConnectionTimeoutSecs(ELASTIC_CONNECT_TIMEOUT)
+        .withSocketTimeoutSecs(ELASTIC_SOCKET_TIMEOUT)
+        .withKeepAliveTimeoutSecs(ELASTIC_KEEP_ALIVE_TIMEOUT)
+        .withBatchSize(ELASTIC_BATCH_SIZE)
+        .withSearchIndexMappingLanguage(ELASTIC_SEARCH_INDEX_MAPPING_LANGUAGE)
+        .withClusterAlias(ELASTIC_SEARCH_CLUSTER_ALIAS)
+        .withSearchType(type);
+    return config;
+  }
+
+  /**
+   * Returns a search config with NL search enabled for OpenSearch. Used by tests that need vector
+   * embeddings without affecting the global app configuration.
+   */
+  public static ElasticSearchConfiguration withNaturalLanguageSearch(
+      ElasticSearchConfiguration config) {
+    org.openmetadata.schema.service.configuration.elasticsearch.NaturalLanguageSearchConfiguration
+        nlSearch =
+            new org.openmetadata.schema.service.configuration.elasticsearch
+                .NaturalLanguageSearchConfiguration();
+    nlSearch.setSemanticSearchEnabled(true);
+    nlSearch.setEnabled(true);
+    config.setNaturalLanguageSearch(nlSearch);
+    return config;
+  }
+
+  private static void configurePipelineServiceClient(OpenMetadataApplicationConfig config) {
+    if (kubeConfigYaml != null) {
+      PipelineServiceClientConfiguration pipelineConfig = new PipelineServiceClientConfiguration();
+      LOG.info("Configuring K8sPipelineClient for pipeline operations");
+      pipelineConfig.setEnabled(true);
+      pipelineConfig.setClassName(
+          "org.openmetadata.service.clients.pipeline.k8s.K8sPipelineClient");
+      pipelineConfig.setMetadataApiEndpoint("http://localhost:8585/api");
+
+      Parameters params = new Parameters();
+      params.setAdditionalProperty("namespace", K8S_NAMESPACE);
+      params.setAdditionalProperty("inCluster", "false");
+      params.setAdditionalProperty("kubeConfigContent", kubeConfigYaml);
+      params.setAdditionalProperty("ingestionImage", "openmetadata/ingestion:latest");
+      params.setAdditionalProperty("serviceAccountName", "default");
+      params.setAdditionalProperty("imagePullPolicy", "IfNotPresent");
+      pipelineConfig.setParameters(params);
+      config.setPipelineServiceClientConfiguration(pipelineConfig);
+    } else {
+      LOG.info("Pipeline service client disabled (K8s not enabled)");
+      config.getPipelineServiceClientConfiguration().setEnabled(false);
+    }
+  }
+
+  private static void configureRdf(OpenMetadataApplicationConfig config) {
+    RdfConfiguration rdfConfig = config.getRdfConfiguration();
+    if (rdfConfig == null) {
+      rdfConfig = new RdfConfiguration();
+      config.setRdfConfiguration(rdfConfig);
+    }
+
+    rdfConfig.setEnabled(rdfEnabled);
+    if (!rdfEnabled) {
+      LOG.info("RDF disabled for this test run");
+      return;
+    }
+
+    LOG.info("Configuring RDF with Fuseki endpoint: {}", fusekiEndpoint);
+    rdfConfig.setBaseUri(java.net.URI.create("https://open-metadata.org/"));
+    rdfConfig.setStorageType(RdfConfiguration.StorageType.FUSEKI);
+    rdfConfig.setRemoteEndpoint(java.net.URI.create(fusekiEndpoint));
+    rdfConfig.setUsername("admin");
+    rdfConfig.setPassword(FUSEKI_ADMIN_PASSWORD);
+    rdfConfig.setDataset(FUSEKI_DATASET);
+    rdfConfig.setMaterializedInferenceEnabled(true);
+    final Integer lineageBatchSize = Integer.getInteger("rdfLineageEdgeBatchSize");
+    if (lineageBatchSize != null) {
+      rdfConfig.setBulkLineageEdgeBatchSize(lineageBatchSize);
+    }
+    final Integer appendPayloadBytes = Integer.getInteger("rdfAppendPayloadBytes");
+    if (appendPayloadBytes != null) {
+      rdfConfig.setMaxAppendPayloadBytes(appendPayloadBytes);
+    }
+    final Integer appendEntityBatchSize = Integer.getInteger("rdfAppendEntityBatchSize");
+    if (appendEntityBatchSize != null) {
+      rdfConfig.setBulkAppendEntityBatchSize(appendEntityBatchSize);
+    }
+
+    LOG.info("RDF configuration complete");
+  }
+
+  private void cleanup() {
+    try {
+      if (SharedEntities.isInitialized()) {
+        SharedEntities.cleanup(SdkClients.adminClient());
+      }
+    } catch (Exception e) {
+      LOG.warn("Error cleaning up shared entities", e);
+    }
+
+    try {
+      synchronized (ADDITIONAL_APPS) {
+        for (DropwizardAppExtension<OpenMetadataApplicationConfig> app : ADDITIONAL_APPS) {
+          try {
+            app.after();
+          } catch (Exception e) {
+            LOG.warn("Error stopping additional Dropwizard app", e);
+          }
+        }
+        ADDITIONAL_APPS.clear();
+      }
+    } catch (Exception e) {
+      LOG.warn("Error stopping additional Dropwizard apps", e);
+    }
+
+    try {
+      if (APP != null) {
+        APP.after();
+        if (APP.getEnvironment() != null
+            && APP.getEnvironment().getApplicationContext() != null
+            && APP.getEnvironment().getApplicationContext().getServer() != null) {
+          APP.getEnvironment().getApplicationContext().getServer().stop();
+        }
+      }
+    } catch (Exception e) {
+      LOG.warn("Error stopping Dropwizard app", e);
+    }
+
+    try {
+      if (WorkflowHandler.isInitialized()) {
+        LOG.info("Shutting down Flowable ProcessEngine...");
+        org.flowable.engine.ProcessEngines.destroy();
+        LOG.info("Flowable ProcessEngine shut down successfully");
+      }
+    } catch (Exception e) {
+      LOG.warn("Error shutting down Flowable ProcessEngine", e);
+    }
+
+    try {
+      if (SEARCH_CONTAINER != null) {
+        SEARCH_CONTAINER.stop();
+      }
+    } catch (Exception e) {
+      LOG.warn("Error stopping search container", e);
+    }
+
+    try {
+      if (FUSEKI_CONTAINER != null) {
+        if (!FUSEKI_CONTAINER.isRunning()) {
+          LOG.error("Fuseki exited during the test run:\n{}", FUSEKI_CONTAINER.getLogs());
+        }
+        FUSEKI_CONTAINER.stop();
+      }
+    } catch (Exception e) {
+      LOG.warn("Error stopping Fuseki container", e);
+    }
+
+    try {
+      if (REDIS_CONTAINER != null) {
+        REDIS_CONTAINER.stop();
+      }
+    } catch (Exception e) {
+      LOG.warn("Error stopping Redis container", e);
+    }
+
+    try {
+      if (K3S_CONTAINER != null) {
+        K3S_CONTAINER.stop();
+      }
+    } catch (Exception e) {
+      LOG.warn("Error stopping K3s container", e);
+    }
+
+    try {
+      if (DATABASE_CONTAINER != null) {
+        DATABASE_CONTAINER.stop();
+      }
+    } catch (Exception e) {
+      LOG.warn("Error stopping database container", e);
+    }
+
+    try {
+      if (OBJECT_STORAGE_CONTAINER != null) {
+        OBJECT_STORAGE_CONTAINER.stop();
+      }
+    } catch (Exception e) {
+      LOG.warn("Error stopping object storage container", e);
+    }
+  }
+
+  // === On-demand S3 container for object-storage tests ===
+
+  public static synchronized void setupObjectStorage() {
+    if (OBJECT_STORAGE_CONTAINER != null && OBJECT_STORAGE_CONTAINER.isRunning()) {
+      LOG.info("Object storage already running at {}", getObjectStorageEndpoint());
+      return;
+    }
+    LOG.info("Starting S3Proxy Testcontainer on-demand...");
+    // S3Proxy stands in for MinIO, whose image was deleted from Docker Hub. It does not
+    // implement bucket lifecycle or object tagging, which S3LogStorage and the asset
+    // service already treat as best-effort. Pin the tag so a newly-published :latest
+    // cannot break integration tests without a code change.
+    OBJECT_STORAGE_CONTAINER =
+        new GenericContainer<>("andrewgaul/s3proxy:4.1.1")
+            .withExposedPorts(9000)
+            .withEnv("S3PROXY_ENDPOINT", "http://0.0.0.0:9000")
+            .withEnv("S3PROXY_AUTHORIZATION", "aws-v2-or-v4")
+            .withEnv("S3PROXY_IDENTITY", "accesskey")
+            .withEnv("S3PROXY_CREDENTIAL", "secretkey")
+            .waitingFor(
+                // S3Proxy has no health endpoint; an unauthenticated GET / answers 403
+                // as soon as it is serving requests.
+                Wait.forHttp("/")
+                    .forPort(9000)
+                    .forStatusCodeMatching(code -> code == 403 || code == 200)
+                    .withStartupTimeout(java.time.Duration.ofSeconds(60)));
+    OBJECT_STORAGE_CONTAINER.start();
+
+    String endpoint = getObjectStorageEndpoint();
+
+    // Create the default test bucket so tests can upload immediately.
+    software.amazon.awssdk.services.s3.S3Client s3 =
+        software.amazon.awssdk.services.s3.S3Client.builder()
+            .region(software.amazon.awssdk.regions.Region.US_EAST_1)
+            .credentialsProvider(
+                software.amazon.awssdk.auth.credentials.StaticCredentialsProvider.create(
+                    software.amazon.awssdk.auth.credentials.AwsBasicCredentials.create(
+                        "accesskey", "secretkey")))
+            .endpointOverride(java.net.URI.create(endpoint))
+            .serviceConfiguration(
+                software.amazon.awssdk.services.s3.S3Configuration.builder()
+                    .pathStyleAccessEnabled(true)
+                    .build())
+            .build();
+    try {
+      boolean exists =
+          s3.listBuckets().buckets().stream().anyMatch(b -> b.name().equals("test-bucket"));
+      if (!exists) {
+        s3.createBucket(
+            software.amazon.awssdk.services.s3.model.CreateBucketRequest.builder()
+                .bucket("test-bucket")
+                .build());
+      }
+    } finally {
+      s3.close();
+    }
+
+    // Expose endpoint to tests that read a system property / env var.
+    System.setProperty("IT_S3_ENDPOINT", endpoint);
+
+    LOG.info("Object storage started at {}", endpoint);
+  }
+
+  public static String getObjectStorageEndpoint() {
+    if (OBJECT_STORAGE_CONTAINER == null || !OBJECT_STORAGE_CONTAINER.isRunning()) {
+      throw new IllegalStateException(
+          "Object storage container not running. Call setupObjectStorage() first.");
+    }
+    return "http://"
+        + OBJECT_STORAGE_CONTAINER.getHost()
+        + ":"
+        + OBJECT_STORAGE_CONTAINER.getMappedPort(9000);
+  }
+
+  // === Static accessor methods for tests ===
+
+  /**
+   * Returns true if K8s (K3s) pipeline scheduler is enabled and running.
+   * K8s is enabled by setting ENABLE_K8S_TESTS=true environment variable or system property
+   * before running tests, or by calling setupK8s() from a test class.
+   */
+  public static boolean isK8sEnabled() {
+    return K3S_CONTAINER != null && K3S_CONTAINER.isRunning();
+  }
+
+  /**
+   * Starts K8s (K3s) container on-demand and configures the pipeline service client.
+   * Call this from test classes that require K8s (e.g., IngestionPipelineResourceIT).
+   * This method is idempotent - calling it multiple times is safe.
+   */
+  public static synchronized void setupK8s() {
+    if (isK8sEnabled()) {
+      LOG.info("K8s already running, skipping setup");
+      return;
+    }
+
+    LOG.info("Setting up K8s (K3s) on-demand for pipeline tests...");
+
+    // Start K3s container
+    org.openmetadata.service.clients.pipeline.PipelineServiceClientFactory.reset();
+
+    K3S_CONTAINER = new K3sContainer(DockerImageName.parse(K3S_IMAGE));
+    K3S_CONTAINER.start();
+    kubeConfigYaml = K3S_CONTAINER.getKubeConfigYaml();
+    LOG.info("K3s container started");
+
+    // Create namespace for pipelines
+    try {
+      io.kubernetes.client.openapi.ApiClient apiClient =
+          io.kubernetes.client.util.Config.fromConfig(new java.io.StringReader(kubeConfigYaml));
+      apiClient.setReadTimeout(30000);
+      apiClient.setConnectTimeout(10000);
+
+      io.kubernetes.client.openapi.apis.CoreV1Api coreApi =
+          new io.kubernetes.client.openapi.apis.CoreV1Api(apiClient);
+      io.kubernetes.client.openapi.models.V1Namespace namespace =
+          new io.kubernetes.client.openapi.models.V1Namespace()
+              .metadata(new io.kubernetes.client.openapi.models.V1ObjectMeta().name(K8S_NAMESPACE));
+      coreApi.createNamespace(namespace).execute();
+      LOG.info("Created K8s namespace: {}", K8S_NAMESPACE);
+    } catch (Exception e) {
+      LOG.warn("Failed to create K8s namespace (may already exist): {}", e.getMessage());
+    }
+
+    // Configure and initialize the pipeline service client
+    PipelineServiceClientConfiguration pipelineConfig = new PipelineServiceClientConfiguration();
+    pipelineConfig.setEnabled(true);
+    pipelineConfig.setClassName("org.openmetadata.service.clients.pipeline.k8s.K8sPipelineClient");
+    pipelineConfig.setMetadataApiEndpoint("http://localhost:" + APP.getLocalPort() + "/api");
+
+    Parameters params = new Parameters();
+    params.setAdditionalProperty("namespace", K8S_NAMESPACE);
+    params.setAdditionalProperty("inCluster", "false");
+    params.setAdditionalProperty("kubeConfigContent", kubeConfigYaml);
+    params.setAdditionalProperty("ingestionImage", "openmetadata/ingestion:latest");
+    params.setAdditionalProperty("serviceAccountName", "default");
+    params.setAdditionalProperty("imagePullPolicy", "IfNotPresent");
+    // Use native Jobs/CronJobs by default instead of OMJob operator
+    params.setAdditionalProperty("useOMJobOperator", "false");
+    pipelineConfig.setParameters(params);
+
+    // Create the pipeline service client with K8s config
+    org.openmetadata.sdk.PipelineServiceClientInterface pipelineClient =
+        org.openmetadata.service.clients.pipeline.PipelineServiceClientFactory
+            .createPipelineServiceClient(pipelineConfig);
+
+    if (APP != null) {
+      APP.getConfiguration().setPipelineServiceClientConfiguration(pipelineConfig);
+    }
+
+    // Update the IngestionPipelineRepository with the new client
+    // This is necessary because the repository caches the client at startup
+    try {
+      org.openmetadata.service.jdbi3.IngestionPipelineRepository repository =
+          (org.openmetadata.service.jdbi3.IngestionPipelineRepository)
+              org.openmetadata.service.Entity.getEntityRepository("ingestionPipeline");
+      repository.setPipelineServiceClient(pipelineClient);
+      LOG.info("Updated IngestionPipelineRepository with K8s pipeline client");
+    } catch (Exception e) {
+      LOG.warn("Could not update IngestionPipelineRepository: {}", e.getMessage());
+      throw new RuntimeException("Failed to configure K8s pipeline client", e);
+    }
+
+    refreshIngestionPipelineResource();
+
+    LOG.info("K8s pipeline service client configured and ready");
+  }
+
+  @SuppressWarnings("unchecked")
+  private static void refreshIngestionPipelineResource() {
+    if (APP == null) {
+      LOG.info("OpenMetadata application is not initialized yet; skipping resource refresh");
+      return;
+    }
+
+    try {
+      Field collectionMapField = CollectionRegistry.class.getDeclaredField("collectionMap");
+      collectionMapField.setAccessible(true);
+
+      Map<String, CollectionRegistry.CollectionDetails> collectionMap =
+          (Map<String, CollectionRegistry.CollectionDetails>)
+              collectionMapField.get(CollectionRegistry.getInstance());
+
+      for (CollectionRegistry.CollectionDetails details : collectionMap.values()) {
+        Object resource = details.getResource();
+        if (resource instanceof IngestionPipelineResource ingestionPipelineResource) {
+          ingestionPipelineResource.initialize(APP.getConfiguration());
+          LOG.info("Refreshed IngestionPipelineResource with K8s pipeline client");
+          return;
+        }
+      }
+
+      LOG.warn("IngestionPipelineResource is not registered; skipping resource refresh");
+    } catch (Exception e) {
+      throw new RuntimeException(
+          "Failed to refresh IngestionPipelineResource with K8s pipeline client", e);
+    }
+  }
+
+  /**
+   * Creates a Rest5Client for direct search operations in tests. Works with both Elasticsearch and
+   * OpenSearch.
+   */
+  public static Rest5Client createSearchClient() {
+    if (SEARCH_CONTAINER == null || !SEARCH_CONTAINER.isRunning()) {
+      throw new IllegalStateException(
+          "Search container is not running. Ensure TestSuiteBootstrap has initialized.");
+    }
+
+    BasicCredentialsProvider credentialsProvider = new BasicCredentialsProvider();
+    credentialsProvider.setCredentials(
+        new AuthScope(null, -1),
+        new UsernamePasswordCredentials(ELASTIC_USER, ELASTIC_PASSWORD.toCharArray()));
+
+    HttpHost httpHost = new HttpHost("http", searchHost, searchPort);
+    Rest5ClientBuilder builder =
+        Rest5Client.builder(httpHost)
+            .setHttpClientConfigCallback(
+                httpClientBuilder -> {
+                  httpClientBuilder.setDefaultCredentialsProvider(credentialsProvider);
+                  // httpclient5 5.6.0 enables automatic gzip decompression by default; the
+                  // elasticsearch-java client also decompresses the response body, so leaving
+                  // both on runs the second pass over already-inflated bytes and throws
+                  // "java.util.zip.ZipException: Not in GZIP format". Let the ES client own
+                  // decompression. Mirrors the production ElasticSearchClient fix.
+                  httpClientBuilder.disableContentCompression();
+                });
+    return builder.build();
+  }
+
+  /**
+   * Returns the application port for direct HTTP access if needed.
+   */
+  public static int getApplicationPort() {
+    if (APP == null) {
+      throw new IllegalStateException(
+          "Application is not running. Ensure TestSuiteBootstrap has initialized.");
+    }
+    return APP.getLocalPort();
+  }
+
+  /**
+   * Returns the application's registered {@link Managed} of the given type, if there is one.
+   *
+   * <p>Dropwizard wraps every managed object in a {@link JettyManaged}, so the instance the
+   * application built is only reachable by unwrapping the lifecycle objects. Tests use this to
+   * reach always-on background workers — typically to pause one for the duration of a class whose
+   * assertions would otherwise race it on a shared table.
+   */
+  public static <T extends Managed> Optional<T> findManagedObject(Class<T> type) {
+    if (APP == null) {
+      throw new IllegalStateException(
+          "Application is not running. Ensure TestSuiteBootstrap has initialized.");
+    }
+    return APP.getEnvironment().lifecycle().getManagedObjects().stream()
+        .filter(JettyManaged.class::isInstance)
+        .map(lifeCycle -> ((JettyManaged) lifeCycle).getManaged())
+        .filter(type::isInstance)
+        .map(type::cast)
+        .findFirst();
+  }
+
+  /**
+   * Returns the admin port for accessing admin endpoints like /prometheus.
+   */
+  public static int getAdminPort() {
+    if (APP == null) {
+      throw new IllegalStateException(
+          "Application is not running. Ensure TestSuiteBootstrap has initialized.");
+    }
+    return APP.getAdminPort();
+  }
+
+  /**
+   * Returns the base URL for the running application.
+   */
+  public static String getBaseUrl() {
+    return "http://localhost:" + getApplicationPort();
+  }
+
+  public static RdfConfiguration getRdfConfiguration() {
+    return APP.getConfiguration().getRdfConfiguration();
+  }
+
+  /** Hostname of the running search engine container (OpenSearch or Elasticsearch). */
+  public static String getSearchHost() {
+    return searchHost;
+  }
+
+  /** Mapped HTTP port of the running search engine container. */
+  public static int getSearchPort() {
+    return searchPort;
+  }
+
+  /** Scheme of the running search engine container — currently always {@code http} in tests. */
+  public static String getSearchScheme() {
+    return "http";
+  }
+
+  /**
+   * Search engine testcontainer (OpenSearch or Elasticsearch). Exposed for failure-path
+   * tests that need to pause/unpause/disconnect the engine to validate retry semantics.
+   * Returns {@code null} if the bootstrap hasn't started yet.
+   */
+  public static GenericContainer<?> getSearchContainer() {
+    return SEARCH_CONTAINER;
+  }
+
+  /**
+   * Returns the Jdbi instance for direct database access if needed.
+   */
+  public static Jdbi getJdbi() {
+    if (jdbi == null) {
+      throw new IllegalStateException(
+          "JDBI is not initialized. Ensure TestSuiteBootstrap has initialized.");
+    }
+    return jdbi;
+  }
+
+  /** The dialect the suite is running against, for tests that exercise dual-dialect SQL. */
+  public static ConnectionType getConnectionType() {
+    if (DATABASE_CONTAINER == null) {
+      throw new IllegalStateException(
+          "Database is not initialized. Ensure TestSuiteBootstrap has initialized.");
+    }
+    return ConnectionType.from(DATABASE_CONTAINER.getDriverClassName());
+  }
+
+  public static OpenMetadataApplicationConfig createApplicationConfigCopy() {
+    if (APP == null || DATABASE_CONTAINER == null || searchHost == null) {
+      throw new IllegalStateException(
+          "Application is not running. Ensure TestSuiteBootstrap has initialized.");
+    }
+    try {
+      return buildRuntimeApplicationConfig();
+    } catch (Exception e) {
+      throw new IllegalStateException("Failed to clone OpenMetadata application config", e);
+    }
+  }
+
+  private static OpenMetadataApplicationConfig buildRuntimeApplicationConfig()
+      throws ConfigurationException, IOException {
+    OpenMetadataApplicationConfig config = readTestAppConfig(CONFIG_PATH);
+
+    HikariCPDataSourceFactory dataSourceFactory =
+        (config.getDataSourceFactory() instanceof HikariCPDataSourceFactory)
+            ? (HikariCPDataSourceFactory) config.getDataSourceFactory()
+            : new HikariCPDataSourceFactory();
+    dataSourceFactory.setUrl(DATABASE_CONTAINER.getJdbcUrl());
+    dataSourceFactory.setUser(DATABASE_CONTAINER.getUsername());
+    dataSourceFactory.setPassword(DATABASE_CONTAINER.getPassword());
+    dataSourceFactory.setDriverClass(DATABASE_CONTAINER.getDriverClassName());
+    dataSourceFactory.setMaxSize(100);
+    dataSourceFactory.setMinSize(20);
+    dataSourceFactory.setInitialSize(20);
+    dataSourceFactory.setMaxWaitForConnection(io.dropwizard.util.Duration.seconds(30));
+    config.setDataSourceFactory(dataSourceFactory);
+
+    String projectRoot = getProjectRoot();
+    config.setElasticSearchConfiguration(getSearchConfig());
+
+    if (config.getMigrationConfiguration() == null) {
+      config.setMigrationConfiguration(
+          new org.openmetadata.service.migration.MigrationConfiguration());
+    }
+    config
+        .getMigrationConfiguration()
+        .setFlywayPath(getFlywayMigrationScriptsLocation(projectRoot));
+    config
+        .getMigrationConfiguration()
+        .setNativePath(getNativeMigrationScriptsLocation(projectRoot));
+
+    String testResourcesPath = getTestResourcesPath(projectRoot);
+    config
+        .getJwtTokenConfiguration()
+        .setRsaprivateKeyFilePath(testResourcesPath + "private_key.der");
+    config.getJwtTokenConfiguration().setRsapublicKeyFilePath(testResourcesPath + "public_key.der");
+
+    configurePipelineServiceClient(config);
+    configureCache(config);
+    configureRdf(config);
+    return config;
+  }
+
+  private static String getProjectRoot() {
+    String projectRoot = System.getProperty("user.dir");
+    Path projectRootPath = Paths.get(projectRoot);
+    if (projectRootPath.endsWith("openmetadata-integration-tests")
+        && projectRootPath.getParent() != null) {
+      projectRoot = projectRootPath.getParent().toString();
+    }
+    return projectRoot;
+  }
+
+  private static String getFlywayMigrationScriptsLocation(String projectRoot) {
+    return projectRoot
+        + "/bootstrap/sql/migrations/flyway/"
+        + DATABASE_CONTAINER.getDriverClassName();
+  }
+
+  private static String getNativeMigrationScriptsLocation(String projectRoot) {
+    return projectRoot + "/bootstrap/sql/migrations/native/";
+  }
+
+  private static String getTestResourcesPath(String projectRoot) {
+    return projectRoot + "/openmetadata-integration-tests/src/test/resources/";
+  }
+
+  public static void registerAdditionalApp(
+      DropwizardAppExtension<OpenMetadataApplicationConfig> app) {
+    ADDITIONAL_APPS.add(app);
+  }
+
+  /**
+   * Returns true if Fuseki was started for this test session.
+   */
+  public static boolean isFusekiEnabled() {
+    return fusekiEndpoint != null;
+  }
+
+  /**
+   * Returns the Fuseki SPARQL endpoint URL for RDF operations.
+   */
+  public static String getFusekiEndpoint() {
+    if (fusekiEndpoint == null) {
+      throw new IllegalStateException(
+          "Fuseki is not initialized. Ensure TestSuiteBootstrap has initialized.");
+    }
+    return fusekiEndpoint;
+  }
+
+  /**
+   * Returns the Fuseki SPARQL query endpoint URL.
+   */
+  public static String getFusekiQueryEndpoint() {
+    return getFusekiEndpoint() + "/sparql";
+  }
+
+  /**
+   * Returns the Fuseki SPARQL update endpoint URL.
+   */
+  public static String getFusekiUpdateEndpoint() {
+    return getFusekiEndpoint() + "/update";
+  }
+
+  /**
+   * Returns the Fuseki Graph Store Protocol endpoint URL.
+   */
+  public static String getFusekiDataEndpoint() {
+    return getFusekiEndpoint() + "/data";
+  }
+
+  /**
+   * Returns the Kubernetes config YAML for accessing the K3s cluster.
+   * Only available when K8s is enabled.
+   */
+  public static String getKubeConfigYaml() {
+    if (kubeConfigYaml == null) {
+      throw new IllegalStateException(
+          "K8s is not enabled. Ensure TestSuiteBootstrap.setupK8s() has been called.");
+    }
+    return kubeConfigYaml;
+  }
+}

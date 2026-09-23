@@ -1,0 +1,265 @@
+/*
+ *  Copyright 2024 Collate.
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+import { APIRequestContext, Page } from '@playwright/test';
+import { Operation } from 'fast-json-patch';
+import { SERVICE_TYPE } from '../../constant/service';
+import { ServiceTypes } from '../../constant/settings';
+import {
+  createOrFetch,
+  okJson,
+  withNotFoundRetry,
+} from '../../utils/apiResponse';
+import { uuid } from '../../utils/common';
+import { visitEntityPageByFqn } from '../../utils/entity';
+import {
+  EntityReference,
+  EntityTypeEndpoint,
+  ResponseDataType,
+  ResponseDataWithServiceType,
+} from './Entity.interface';
+import { EntityClass } from './EntityClass';
+
+export interface DashboardDataModel extends ResponseDataWithServiceType {
+  columns: EntityReference[];
+  dataModelType: string;
+  project: string;
+}
+
+export interface Column {
+  name: string;
+  dataType: string;
+  dataLength?: number;
+  dataTypeDisplay: string;
+  description: string;
+  children?: Column[];
+}
+
+export class DashboardDataModelClass extends EntityClass {
+  private readonly dashboardDataModelName: string;
+  private readonly projectName: string;
+  service: {
+    name: string;
+    serviceType: string;
+    connection: {
+      config: {
+        type: string;
+        hostPort: string;
+        connection: {
+          provider: string;
+          username: string;
+          password: string;
+        };
+        supportsMetadataExtraction: boolean;
+      };
+    };
+  };
+
+  children: Column[];
+
+  entity: {
+    name: string;
+    displayName: string;
+    service: string;
+    description: string;
+    columns: Column[];
+    dataModelType: string;
+    project: string;
+  };
+
+  serviceResponseData: ResponseDataType = {} as ResponseDataType;
+  entityResponseData: DashboardDataModel = {} as DashboardDataModel;
+
+  constructor(name?: string) {
+    super(EntityTypeEndpoint.DataModel);
+
+    this.dashboardDataModelName = `pw-dashboard-data-model-${uuid()}`;
+    this.projectName = `pw-project-${uuid()}`;
+
+    this.service = {
+      name: name ?? `pw-dashboard-service-${uuid()}`,
+      serviceType: 'Superset',
+      connection: {
+        config: {
+          type: 'Superset',
+          hostPort: 'http://localhost:8088',
+          connection: {
+            provider: 'ldap',
+            username: 'admin',
+            password: 'admin',
+          },
+          supportsMetadataExtraction: true,
+        },
+      },
+    };
+
+    this.children = [
+      {
+        name: 'country_name',
+        dataType: `VARCHAR`,
+        dataLength: 256,
+        dataTypeDisplay: 'varchar',
+        description: 'Name of the country.',
+      },
+      {
+        name: 'user_details',
+        dataType: `VARCHAR`,
+        dataLength: 256,
+        dataTypeDisplay: 'varchar',
+        description: 'User details.',
+        children: [
+          {
+            name: 'name',
+            dataType: `VARCHAR`,
+            dataLength: 256,
+            dataTypeDisplay: 'varchar',
+            description: 'Name of the user.',
+            children: [
+              {
+                name: 'first_name',
+                dataType: `VARCHAR`,
+                dataLength: 256,
+                dataTypeDisplay: 'varchar',
+                description: 'First name of the user.',
+              },
+              {
+                name: 'last_name',
+                dataType: `VARCHAR`,
+                dataLength: 256,
+                dataTypeDisplay: 'varchar',
+                description: 'Last name of the user.',
+              },
+            ],
+          },
+        ],
+      },
+    ];
+
+    this.entity = {
+      name: this.dashboardDataModelName,
+      displayName: this.dashboardDataModelName,
+      description: `Description for ${this.dashboardDataModelName}`,
+      service: this.service.name,
+      columns: this.children,
+      dataModelType: 'SupersetDataModel',
+      project: this.projectName,
+    };
+
+    this.type = 'DashboardDataModel';
+    this.childrenTabId = 'model';
+    this.childrenSelectorId = this.children[0].name;
+    this.serviceCategory = SERVICE_TYPE.Dashboard;
+    this.serviceType = ServiceTypes.DASHBOARD_SERVICES;
+  }
+
+  async create(apiContext: APIRequestContext) {
+    this.serviceResponseData = await createOrFetch(apiContext, {
+      label: 'DashboardDataModelClass.create service',
+      createPath: '/api/v1/services/dashboardServices',
+      fqnSegments: [this.service.name],
+      data: this.service,
+    });
+
+    // Both hand-rolled loops that used to live here — a 409 fallback for the
+    // service and a 5xx re-post for the data model — are now inside
+    // createOrFetch, which additionally looks the conflicting entity up with
+    // include=all so a soft-deleted leftover is found rather than 404ing.
+    this.entityResponseData = await createOrFetch(apiContext, {
+      label: 'DashboardDataModelClass.create dataModel',
+      createPath: '/api/v1/dashboard/datamodels',
+      // DashboardDataModelRepository builds the FQN as `<serviceFqn>.model.<name>`
+      // — a literal `model` segment the other entity types do not have.
+      fqnSegments: [this.service.name, 'model', this.entity.name],
+      data: this.entity,
+    });
+
+    const dataModelFqn = this.entityResponseData.fullyQualifiedName;
+    if (!dataModelFqn) {
+      throw new Error(
+        'Dashboard data model response is missing its fully qualified name'
+      );
+    }
+    this.childrenSelectorId =
+      this.entityResponseData.columns?.[0]?.fullyQualifiedName ??
+      `${dataModelFqn}.${this.children[0].name}`;
+
+    return {
+      service: this.serviceResponseData,
+      entity: this.entityResponseData,
+    };
+  }
+
+  async patch({
+    apiContext,
+    patchData,
+  }: {
+    apiContext: APIRequestContext;
+    patchData: Operation[];
+  }) {
+    const response = await withNotFoundRetry(() =>
+      apiContext.patch(
+        `/api/v1/dashboard/datamodels/name/${this.entityResponseData?.fullyQualifiedName}`,
+        {
+          data: patchData,
+          headers: {
+            'Content-Type': 'application/json-patch+json',
+          },
+        }
+      )
+    );
+
+    this.entityResponseData = await okJson(
+      response,
+      'DashboardDataModelClass.patch'
+    );
+
+    return {
+      entity: this.entityResponseData,
+    };
+  }
+
+  get() {
+    return {
+      service: this.serviceResponseData,
+      entity: this.entityResponseData,
+    };
+  }
+
+  public set(data: {
+    entity: DashboardDataModel;
+    service: ResponseDataType;
+  }): void {
+    this.entityResponseData = data.entity;
+    this.serviceResponseData = data.service;
+  }
+
+  async visitEntityPage(page: Page) {
+    await visitEntityPageByFqn({
+      page,
+      endpoint: this.endpoint,
+      fqn: this.entityResponseData?.fullyQualifiedName ?? '',
+    });
+  }
+
+  async delete(apiContext: APIRequestContext) {
+    const serviceResponse = await apiContext.delete(
+      `/api/v1/services/dashboardServices/name/${encodeURIComponent(
+        this.serviceResponseData?.fullyQualifiedName ?? ''
+      )}?recursive=true&hardDelete=true`
+    );
+
+    return {
+      service: serviceResponse.body,
+      entity: this.entityResponseData,
+    };
+  }
+}

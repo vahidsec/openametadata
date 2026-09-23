@@ -1,0 +1,9 @@
+{
+  "name": "system-notification-thread-entity-deleted",
+  "fullyQualifiedName": "system-notification-thread-entity-deleted",
+  "displayName": "Conversation Deleted Notification",
+  "description": "System default template for deleted Conversation V2 entities",
+  "provider": "system",
+  "templateSubject": "[{{publisherName}}] - Change Event Update from {{emailingEntity}}",
+  "templateBody": "<strong>@{{event.userName}}</strong> deleted a conversation {{#with (parseEntityLink entity.about) as |link|}}{{#if link.field}}about <strong>{{link.field}}</strong> {{/if}}{{/with}}for <strong>{{camelCaseToTitle entity.entityRef.type}}</strong> <a href=\"{{buildEntityUrl entity.entityRef.type entity.entityRef.fullyQualifiedName}}\">{{#if entity.entityRef.displayName}}{{entity.entityRef.displayName}}{{else}}{{entity.entityRef.fullyQualifiedName}}{{/if}}</a>{{#if entity.message}}<br><br><strong>🗑️ Deleted message:</strong><br><blockquote>{{{processMentions entity.message}}}</blockquote>{{/if}}"
+}

@@ -1,0 +1,291 @@
+/*
+ *  Copyright 2022 Collate.
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+import { RightOutlined } from '@ant-design/icons';
+import { Typography } from 'antd';
+import type { ReactNode } from 'react';
+import ReactDOM from 'react-dom';
+import type { MentionSuggestionsItem } from '../components/ActivityFeed/FeedEditor/FeedEditor.interface';
+import { EntityUrlMapType, ENTITY_URL_MAP } from '../constants/Feeds.constants';
+import { EntityType } from '../enums/entity.enum';
+import { SearchIndex } from '../enums/search.enum';
+import { OwnerType } from '../enums/user.enum';
+import { ActivityEventType } from '../generated/entity/activity/activityEvent';
+import type { User } from '../generated/entity/teams/user';
+import { searchQuery } from '../rest/searchAPI';
+import { getRandomColor } from './ColorUtils';
+import { getEntityBreadcrumbs } from './EntityBreadcrumbPureUtils';
+import { getEntityPlaceHolder } from './EntityDisplayPureUtils';
+import { getEntityName } from './EntityNameUtils';
+import { ENTITY_LINK_SEPARATOR } from './EntityPureUtils';
+import { buildMentionLink } from './FeedUtilsPure';
+import { t, Transi18next } from './i18next/LocalUtil';
+import {
+  getImageWithResolutionAndFallback,
+  ImageQuality,
+} from './ProfilerUtils';
+import { getTermQuery } from './SearchPureUtils';
+
+export async function suggestions(
+  searchTerm: string,
+  mentionChar: string
+): Promise<MentionSuggestionsItem[]> {
+  if (mentionChar === '@') {
+    let atValues = [];
+
+    const data = await searchQuery({
+      query: searchTerm ?? '',
+      pageNumber: 1,
+      pageSize: 5,
+      queryFilter: getTermQuery({ isBot: 'false' }),
+      sortField: 'displayName.keyword',
+      sortOrder: 'asc',
+      searchIndex: [SearchIndex.USER, SearchIndex.TEAM],
+    });
+    const hits = data.hits.hits;
+
+    atValues = await Promise.all(
+      hits.map(async (hit) => {
+        const entityType = hit._source.entityType;
+        const name = getEntityPlaceHolder(
+          `@${hit._source.name ?? hit._source.displayName}`,
+          hit._source.deleted
+        );
+
+        return {
+          id: hit._id,
+          value: name,
+          link: buildMentionLink(
+            ENTITY_URL_MAP[entityType as EntityUrlMapType],
+            hit._source.name
+          ),
+          type:
+            entityType === EntityType.USER ? OwnerType.USER : OwnerType.TEAM,
+          name: hit._source.name,
+          displayName: hit._source.displayName,
+        };
+      })
+    );
+
+    return atValues as MentionSuggestionsItem[];
+  } else {
+    let hashValues = [];
+    const data = await searchQuery({
+      query: searchTerm ?? '',
+      pageNumber: 1,
+      pageSize: 5,
+      sortField: 'displayName.keyword',
+      sortOrder: 'asc',
+      searchIndex: SearchIndex.DATA_ASSET,
+    });
+    const hits = data.hits.hits;
+
+    hashValues = hits.map((hit) => {
+      const entityType = hit._source.entityType;
+      const breadcrumbs = getEntityBreadcrumbs(
+        hit._source,
+        entityType as EntityType,
+        false
+      );
+
+      return {
+        id: hit._id,
+        value: `#${entityType}/${hit._source.name}`,
+        link: buildMentionLink(
+          entityType,
+          hit._source.fullyQualifiedName ?? ''
+        ),
+        type: entityType,
+        name: hit._source.displayName || hit._source.name,
+        breadcrumbs,
+      };
+    });
+
+    return hashValues;
+  }
+}
+
+/**
+ *
+ * @param item  - MentionSuggestionsItem
+ * @param user - User
+ * @returns HTMLDIVELEMENT
+ */
+export const userMentionItemWithAvatar = (
+  item: MentionSuggestionsItem,
+  user?: User
+) => {
+  const wrapper = document.createElement('div');
+  const profileUrl =
+    getImageWithResolutionAndFallback(
+      ImageQuality['6x'],
+      user?.profile?.images
+    ) ?? '';
+
+  const { color, character } = getRandomColor(item.name);
+
+  ReactDOM.render(
+    <div className="d-flex gap-2">
+      <div className="mention-profile-image">
+        {profileUrl ? (
+          <img
+            alt={item.name}
+            data-testid="profile-image"
+            referrerPolicy="no-referrer"
+            src={profileUrl}
+          />
+        ) : (
+          <div
+            className="flex-center shrink align-middle mention-avatar"
+            data-testid="avatar"
+            style={{ backgroundColor: color }}>
+            <span>{character}</span>
+          </div>
+        )}
+      </div>
+      <span className="d-flex items-center truncate w-56">
+        {getEntityName(item)}
+      </span>
+    </div>,
+    wrapper
+  );
+
+  return wrapper;
+};
+
+/**
+ * if entity field is columns::name::description
+ * return columns > name > description
+ */
+export const getEntityFieldDisplay = (entityField: string) => {
+  if (entityField && entityField.length) {
+    const entityFields = entityField.split(ENTITY_LINK_SEPARATOR);
+    const separator = (
+      <span className="p-x-xss">
+        <RightOutlined className="text-xs m-t-xss cursor-default text-grey-muted align-middle " />
+      </span>
+    );
+
+    return entityFields.map((field, i) => {
+      return (
+        <span key={`field-${field}`}>
+          {t(`label.${field}`, { defaultValue: field })}
+          {i < entityFields.length - 1 ? separator : null}
+        </span>
+      );
+    });
+  }
+
+  return null;
+};
+
+const renderFieldActionHeader = (field: string, action: string): ReactNode => (
+  <Transi18next
+    i18nKey="message.feed-field-action-entity-header"
+    renderElement={
+      <Typography.Text className="font-bold" style={{ fontSize: '14px' }} />
+    }
+    values={{ field, action }}
+  />
+);
+
+const ACTIVITY_EVENT_HEADER_RENDERERS: Partial<
+  Record<ActivityEventType, () => ReactNode>
+> = {
+  [ActivityEventType.EntityCreated]: () => (
+    <Typography.Text className="font-bold">
+      {t('label.created-lowercase')}
+    </Typography.Text>
+  ),
+  [ActivityEventType.EntityDeleted]: () => (
+    <Typography.Text className="font-bold">
+      {t('label.deleted-lowercase')}
+    </Typography.Text>
+  ),
+  [ActivityEventType.EntitySoftDeleted]: () => (
+    <Typography.Text className="font-bold">
+      {t('label.deleted-lowercase')}
+    </Typography.Text>
+  ),
+  [ActivityEventType.EntityRestored]: () => (
+    <Typography.Text className="font-bold">
+      {t('label.restored-lowercase')}
+    </Typography.Text>
+  ),
+  [ActivityEventType.DescriptionUpdated]: () =>
+    renderFieldActionHeader(
+      t('label.description'),
+      t('label.updated-lowercase')
+    ),
+  [ActivityEventType.ColumnDescriptionUpdated]: () =>
+    renderFieldActionHeader(
+      t('label.description'),
+      t('label.updated-lowercase')
+    ),
+  [ActivityEventType.TagsUpdated]: () =>
+    renderFieldActionHeader(t('label.tag-plural'), t('label.added-lowercase')),
+  [ActivityEventType.ColumnTagsUpdated]: () =>
+    renderFieldActionHeader(t('label.tag-plural'), t('label.added-lowercase')),
+  [ActivityEventType.OwnerUpdated]: () =>
+    renderFieldActionHeader(t('label.owner'), t('label.updated-lowercase')),
+  [ActivityEventType.DomainUpdated]: () =>
+    renderFieldActionHeader(t('label.domain'), t('label.updated-lowercase')),
+  [ActivityEventType.TierUpdated]: () =>
+    renderFieldActionHeader(t('label.tier'), t('label.updated-lowercase')),
+  [ActivityEventType.CustomPropertyUpdated]: () => (
+    <Transi18next
+      i18nKey="message.feed-custom-property-header"
+      renderElement={<Typography.Text className="font-bold" />}
+    />
+  ),
+  [ActivityEventType.TestCaseStatusChanged]: () => (
+    <Transi18next
+      i18nKey="message.feed-test-case-header"
+      renderElement={<Typography.Text className="font-bold" />}
+    />
+  ),
+  [ActivityEventType.PipelineStatusChanged]: () => (
+    <Typography.Text className="font-bold">
+      {t('label.pipeline-status-changed')}
+    </Typography.Text>
+  ),
+};
+
+export const getActivityEventHeaderText = (
+  eventType?: ActivityEventType,
+  fieldName?: string,
+  _entityType?: EntityType
+): ReactNode => {
+  if (!eventType) {
+    return t('label.posted-on-lowercase');
+  }
+
+  const renderHeader = ACTIVITY_EVENT_HEADER_RENDERERS[eventType];
+  if (renderHeader) {
+    return renderHeader();
+  }
+
+  if (fieldName) {
+    return (
+      <Typography.Text className="font-bold">
+        {t('label.updated-field-for-lowercase', { field: fieldName })}
+      </Typography.Text>
+    );
+  }
+
+  return (
+    <Typography.Text className="font-bold">
+      {t('label.updated-lowercase')}
+    </Typography.Text>
+  );
+};

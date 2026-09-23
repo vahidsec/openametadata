@@ -1,0 +1,16 @@
+{
+  "$id": "https://open-metadata.org/schema/api/auth/basicAuth.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "BasicAuthMechanism",
+  "description": "User basic Auth Mechanism.",
+  "type": "object",
+  "javaType": "org.openmetadata.schema.auth.BasicAuthMechanism",
+  "properties": {
+    "password": {
+      "description": "User Password",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": ["password"]
+}

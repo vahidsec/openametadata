@@ -1,0 +1,211 @@
+/*
+ *  Copyright 2023 Collate.
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+import {
+  CheckOutlined,
+  CloseOutlined,
+  ExclamationCircleFilled,
+} from '@ant-design/icons';
+import { Button, Input, Space, Tooltip, Typography } from 'antd';
+import { isEmpty } from 'lodash';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { ReactComponent as EditIcon } from '../../../../../assets/svg/edit-new.svg';
+import { DE_ACTIVE_COLOR } from '../../../../../constants/constants';
+import { Team } from '../../../../../generated/entity/teams/team';
+import { useAuth } from '../../../../../hooks/authHooks';
+import { useApplicationStore } from '../../../../../hooks/useApplicationStore';
+import { getEntityName } from '../../../../../utils/EntityNameUtils';
+import { hasEditAccess } from '../../../../../utils/EntityPermissionUtils';
+import { getDerivedPermissionFlags } from '../../../../../utils/PermissionDerivation';
+import { showErrorToast } from '../../../../../utils/ToastUtils';
+import { TeamsHeadingLabelProps } from '../team.interface';
+
+const TeamsHeadingLabel = ({
+  currentTeam,
+  updateTeamHandler,
+  entityPermissions,
+}: TeamsHeadingLabelProps) => {
+  const { t } = useTranslation();
+  const [isLoading, setIsLoading] = useState(false);
+  const [isHeadingEditing, setIsHeadingEditing] = useState(false);
+  const [heading, setHeading] = useState(
+    currentTeam ? currentTeam.displayName : ''
+  );
+  const { isAdminUser } = useAuth();
+  const { currentUser } = useApplicationStore();
+  const { owners } = useMemo(() => currentTeam, [currentTeam]);
+
+  const isCurrentTeamOwner = useMemo(
+    () => currentUser && hasEditAccess(owners ?? [], currentUser),
+    [owners, currentUser]
+  );
+
+  // Consumer via the `entityPermissions: OperationPermission` prop (raw contract kept per
+  // Task 8 rule 2). The old object literal also computed a `hasEditPermission` field (bare
+  // `entityPermissions.EditAll`) that was never destructured/consumed — dropped as dead code
+  // (Task 7/8 precedent). hasEditDisplayNamePermission's raw `EditDisplayName || EditAll` ->
+  // canEditDisplayName: explicit-deny-wins fix (Task 6 Finding 1). No `deleted` argument — the
+  // old expression never gated on currentTeam.deleted itself (that check is applied
+  // separately, externally, in the JSX render condition below).
+  const { canEditDisplayName: hasEditDisplayNamePermission } = useMemo(
+    () => getDerivedPermissionFlags(entityPermissions),
+    [entityPermissions]
+  );
+  const hasAccess = isAdminUser;
+
+  const onHeadingSave = async (): Promise<void> => {
+    if (isEmpty(heading)) {
+      return showErrorToast(
+        t('label.field-required', {
+          field: t('label.display-name'),
+        })
+      );
+    }
+    if (currentTeam) {
+      setIsLoading(true);
+      const updatedData: Team = {
+        ...currentTeam,
+        displayName: heading,
+      };
+
+      await updateTeamHandler(updatedData);
+      setIsLoading(false);
+    }
+    setIsHeadingEditing(false);
+  };
+
+  const handleClose = useCallback(() => {
+    setHeading(currentTeam ? getEntityName(currentTeam) : '');
+    setIsHeadingEditing(false);
+  }, [currentTeam]);
+
+  const teamHeadingRender = useMemo(() => {
+    const headingTitle = heading ? (
+      <Typography.Title
+        className="m-b-0 flex-1 w-min-0"
+        data-testid="team-heading"
+        ellipsis={{ tooltip: true }}
+        level={5}>
+        {heading}
+      </Typography.Title>
+    ) : (
+      <Typography.Text
+        className="m-b-0 flex-1 w-min-0 text-grey-muted text-sm"
+        data-testid="team-heading">
+        {t('label.no-entity', {
+          entity: t('label.display-name'),
+        })}
+      </Typography.Text>
+    );
+
+    const canEditHeading = hasAccess || isCurrentTeamOwner;
+    const editHeadingButton = canEditHeading && !currentTeam.deleted && (
+      <Tooltip
+        placement="right"
+        title={
+          hasEditDisplayNamePermission
+            ? t('label.edit-entity', {
+                entity: t('label.display-name'),
+              })
+            : t('message.no-permission-for-action')
+        }>
+        <Button
+          className="p-0 edit-team-name flex-center"
+          data-testid="edit-team-name"
+          disabled={!hasEditDisplayNamePermission}
+          icon={<EditIcon color={DE_ACTIVE_COLOR} width="12px" />}
+          size="small"
+          type="text"
+          onClick={(e) => {
+            // Used to stop click propagation event to parent TeamDetailV1 collapsible panel
+            e.stopPropagation();
+            setIsHeadingEditing(true);
+          }}
+        />
+      </Tooltip>
+    );
+
+    return isHeadingEditing ? (
+      // Used onClick stop click propagation event anywhere in the component to parent
+      // TeamDetailsV1 component collapsible panel
+      <div
+        className="d-flex gap-2 items-center teams-heading-label-edit-row w-full w-min-0"
+        role="presentation"
+        onClick={(e) => e.stopPropagation()}>
+        <Input
+          className="flex-1 w-min-0"
+          data-testid="team-name-input"
+          placeholder={t('message.enter-comma-separated-field', {
+            field: t('label.term-lowercase'),
+          })}
+          type="text"
+          value={heading}
+          onChange={(e) => setHeading(e.target.value)}
+        />
+        <Space className="flex-none" data-testid="buttons" size={4}>
+          <Button
+            className="rounded-4 text-sm p-xss"
+            data-testid="cancelAssociatedTag"
+            disabled={isLoading}
+            type="primary"
+            onMouseDown={handleClose}>
+            <CloseOutlined />
+          </Button>
+          <Button
+            className="rounded-4 text-sm p-xss"
+            data-testid="saveAssociatedTag"
+            loading={isLoading}
+            type="primary"
+            onMouseDown={onHeadingSave}>
+            <CheckOutlined />
+          </Button>
+        </Space>
+      </div>
+    ) : (
+      <>
+        <>
+          {headingTitle}
+          {editHeadingButton}
+        </>
+        {currentTeam.deleted && (
+          <div
+            className="deleted-badge-button text-xs flex-center"
+            data-testid="deleted-badge">
+            <ExclamationCircleFilled className="m-r-xss" />
+            {t('label.deleted')}
+          </div>
+        )}
+      </>
+    );
+  }, [
+    heading,
+    isHeadingEditing,
+    hasEditDisplayNamePermission,
+    currentTeam,
+    isLoading,
+  ]);
+
+  useEffect(() => {
+    if (currentTeam) {
+      setHeading(currentTeam.displayName ?? currentTeam.name);
+    }
+  }, [currentTeam]);
+
+  return (
+    <div className="d-flex items-center gap-1 teams-heading-label-container w-min-0">
+      {teamHeadingRender}
+    </div>
+  );
+};
+
+export default TeamsHeadingLabel;

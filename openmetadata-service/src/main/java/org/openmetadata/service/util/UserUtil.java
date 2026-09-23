@@ -1,0 +1,884 @@
+/*
+ *  Copyright 2021 Collate
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+package org.openmetadata.service.util;
+
+import static org.openmetadata.common.utils.CommonUtil.listOrEmpty;
+import static org.openmetadata.common.utils.CommonUtil.nullOrEmpty;
+import static org.openmetadata.schema.entity.teams.AuthenticationMechanism.AuthType.JWT;
+import static org.openmetadata.schema.type.Include.NON_DELETED;
+import static org.openmetadata.service.Entity.ADMIN_ROLE;
+import static org.openmetadata.service.Entity.ADMIN_USER_NAME;
+import static org.openmetadata.service.jdbi3.UserRepository.AUTH_MECHANISM_FIELD;
+
+import at.favre.lib.crypto.bcrypt.BCrypt;
+import jakarta.json.JsonPatch;
+import jakarta.ws.rs.core.UriInfo;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+import lombok.extern.slf4j.Slf4j;
+import org.openmetadata.schema.api.security.AuthorizerConfiguration;
+import org.openmetadata.schema.api.teams.CreateTeam;
+import org.openmetadata.schema.api.teams.CreateUser;
+import org.openmetadata.schema.auth.BasicAuthMechanism;
+import org.openmetadata.schema.auth.JWTAuthMechanism;
+import org.openmetadata.schema.auth.JWTTokenExpiry;
+import org.openmetadata.schema.entity.teams.AuthenticationMechanism;
+import org.openmetadata.schema.entity.teams.Role;
+import org.openmetadata.schema.entity.teams.Team;
+import org.openmetadata.schema.entity.teams.User;
+import org.openmetadata.schema.security.client.OpenMetadataJWTClientConfig;
+import org.openmetadata.schema.services.connections.metadata.AuthProvider;
+import org.openmetadata.schema.type.ChangeEvent;
+import org.openmetadata.schema.type.EntityReference;
+import org.openmetadata.schema.type.EventType;
+import org.openmetadata.schema.type.LandingPageSettings;
+import org.openmetadata.schema.utils.EntityInterfaceUtil;
+import org.openmetadata.schema.utils.JsonUtils;
+import org.openmetadata.sdk.exception.UserCreationException;
+import org.openmetadata.service.Entity;
+import org.openmetadata.service.exception.BadRequestException;
+import org.openmetadata.service.exception.EntityNotFoundException;
+import org.openmetadata.service.jdbi3.EntityRepository;
+import org.openmetadata.service.jdbi3.UserRepository;
+import org.openmetadata.service.security.AuthenticationException;
+import org.openmetadata.service.security.SecurityUtil;
+import org.openmetadata.service.security.auth.CatalogSecurityContext;
+import org.openmetadata.service.security.auth.SecurityConfigurationManager;
+import org.openmetadata.service.security.jwt.JWTTokenGenerator;
+import org.openmetadata.service.util.EntityUtil.Fields;
+import org.openmetadata.service.util.RestUtil.PutResponse;
+import org.openmetadata.service.util.email.EmailUtil;
+
+@Slf4j
+public final class UserUtil {
+  private static final SecureRandom RANDOM = new SecureRandom();
+  private static final String SUFFIX_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789";
+  private static final int SUFFIX_LENGTH = 4;
+  private static final int MAX_USERNAME_GENERATION_ATTEMPTS = 100;
+
+  private UserUtil() {
+    // Private constructor for util class
+  }
+
+  /**
+   * Generate a unique username from email address. Uses email prefix, adds random suffix on
+   * collision.
+   *
+   * @param email user's email address
+   * @param existsChecker predicate to check if username already exists
+   * @return unique username
+   * @throws IllegalArgumentException if email is null/empty or existsChecker is null
+   * @throws IllegalStateException if unable to generate unique username after max attempts
+   */
+  public static String generateUsernameFromEmail(String email, Predicate<String> existsChecker) {
+    if (nullOrEmpty(email)) {
+      throw new IllegalArgumentException("Email cannot be null or empty");
+    }
+    if (existsChecker == null) {
+      throw new IllegalArgumentException("ExistsChecker predicate cannot be null");
+    }
+
+    String baseUsername = email.toLowerCase().split("@")[0];
+
+    if (!existsChecker.test(baseUsername)) {
+      return baseUsername;
+    }
+
+    int attempts = 0;
+    String username;
+    do {
+      if (attempts >= MAX_USERNAME_GENERATION_ATTEMPTS) {
+        throw new IllegalStateException(
+            String.format(
+                "Unable to generate unique username for email '%s' after %d attempts",
+                email, MAX_USERNAME_GENERATION_ATTEMPTS));
+      }
+      String suffix = generateRandomSuffix();
+      username = baseUsername + "_" + suffix;
+      attempts++;
+    } while (existsChecker.test(username));
+
+    return username;
+  }
+
+  /**
+   * Resolve the OpenMetadata username for an already-authenticated email address.
+   *
+   * <p>Fails closed rather than guessing. When no account holds the email, the email's local part
+   * is only usable as a first-login username if no other account already owns that name —
+   * otherwise an unregistered address would resolve onto someone else's identity. Callers that
+   * need caching should wrap this; the resolution itself is deliberately side-effect free.
+   *
+   * @param email authenticated email address
+   * @return the stored username, or the local part when it is unclaimed
+   * @throws AuthenticationException when the email is unknown and its local part is taken
+   */
+  /**
+   * The username an email resolves to, and whether a stored account actually backs it. Callers
+   * must not cache a name that no account owns: it is a first-login bootstrap guess, and account
+   * creation does not invalidate identity caches.
+   */
+  public record ResolvedUserName(String userName, boolean backedByAccount) {}
+
+  public static String resolveUserNameForEmail(String email) {
+    return resolveUserName(email).userName();
+  }
+
+  public static ResolvedUserName resolveUserName(String email) {
+    UserRepository userRepository = Entity.getUserRepository();
+    try {
+      return new ResolvedUserName(
+          userRepository.getActiveUserByEmailForAuth(email, new Fields(Set.of("name"))).getName(),
+          true);
+    } catch (EntityNotFoundException e) {
+      String candidate = email.split("@")[0];
+      if (userRepository.checkUserNameExists(candidate)) {
+        throw new AuthenticationException(
+            String.format(
+                "User with email %s is not registered. Contact your administrator.", email));
+      }
+      return new ResolvedUserName(candidate, false);
+    }
+  }
+
+  private static String generateRandomSuffix() {
+    StringBuilder sb = new StringBuilder(SUFFIX_LENGTH);
+    for (int i = 0; i < SUFFIX_LENGTH; i++) {
+      sb.append(SUFFIX_CHARS.charAt(RANDOM.nextInt(SUFFIX_CHARS.length())));
+    }
+    return sb.toString();
+  }
+
+  public static boolean isRetryableUserCreationConflict(Throwable throwable) {
+    Throwable current = throwable;
+    while (current != null) {
+      String message = current.getMessage();
+      if (message != null) {
+        String normalizedMessage = message.toLowerCase();
+        if (normalizedMessage.contains("entity already exists")
+            || normalizedMessage.contains("duplicate")
+            || normalizedMessage.contains("already exists")) {
+          return true;
+        }
+      }
+      current = current.getCause();
+    }
+    return false;
+  }
+
+  public static void addUsers(
+      AuthProvider authProvider, Set<String> adminUsers, String domain, Boolean isAdmin) {
+    for (String keyValue : adminUsers) {
+      try {
+        String userName = "";
+        String password = "";
+        if (keyValue.contains(":")) {
+          String[] keyValueArray = keyValue.split(":");
+          userName = keyValueArray[0];
+          password = keyValueArray[1];
+        } else {
+          userName = keyValue;
+          password = getPassword(userName);
+        }
+        createOrUpdateUser(authProvider, userName, password, domain, isAdmin);
+      } catch (Exception ex) {
+        LOG.error("[BootstrapUser] Encountered Exception while bootstrapping admin user", ex);
+      }
+    }
+  }
+
+  /**
+   * Create or update admin users based on email addresses from configuration. Processes adminEmails
+   * (new config) first, then falls back to adminPrincipals (legacy) for backward compatibility.
+   *
+   * @param authProvider authentication provider
+   * @param authConfig authorizer configuration containing adminEmails and adminPrincipals
+   */
+  public static void createOrUpdateAdminUsers(
+      AuthProvider authProvider, AuthorizerConfiguration authConfig) {
+    if (authConfig == null) {
+      LOG.warn("[BootstrapUser] AuthorizerConfiguration is null, skipping admin user creation");
+      return;
+    }
+
+    Set<String> processedEmails = new HashSet<>();
+
+    Set<String> adminEmails = authConfig.getAdminEmails();
+    if (adminEmails != null && !adminEmails.isEmpty()) {
+      for (String email : adminEmails) {
+        if (nullOrEmpty(email)) {
+          continue;
+        }
+        String normalizedEmail = email.toLowerCase();
+        if (processedEmails.contains(normalizedEmail)) {
+          continue;
+        }
+        processedEmails.add(normalizedEmail);
+        try {
+          createOrUpdateAdminByEmail(authProvider, normalizedEmail);
+        } catch (Exception ex) {
+          LOG.error("[BootstrapUser] Failed to create/update admin user for email: {}", email, ex);
+        }
+      }
+    }
+
+    Set<String> adminPrincipals = authConfig.getAdminPrincipals();
+    if (adminPrincipals != null && !adminPrincipals.isEmpty()) {
+      String domain = authConfig.getPrincipalDomain();
+      if (nullOrEmpty(domain)) {
+        domain = "openmetadata.org";
+      }
+      for (String principal : adminPrincipals) {
+        if (nullOrEmpty(principal)) {
+          continue;
+        }
+        String email = (principal + "@" + domain).toLowerCase();
+        if (processedEmails.contains(email)) {
+          LOG.debug(
+              "[BootstrapUser] Skipping adminPrincipal '{}' - already processed via adminEmails",
+              principal);
+          continue;
+        }
+        processedEmails.add(email);
+        try {
+          // Legacy adminPrincipals match existing users BY NAME. Resolving them by the
+          // synthesized principal@domain email would miss users whose stored email differs
+          // and create a duplicate admin account instead of promoting the real one.
+          createOrUpdateUser(authProvider, principal, getPassword(principal), domain, true);
+        } catch (Exception ex) {
+          LOG.error(
+              "[BootstrapUser] Failed to create/update admin user for principal: {}",
+              principal,
+              ex);
+        }
+      }
+    }
+  }
+
+  private static void createOrUpdateAdminByEmail(AuthProvider authProvider, String email) {
+    UserRepository userRepository = (UserRepository) Entity.getEntityRepository(Entity.USER);
+
+    Set<String> fieldList = new HashSet<>(userRepository.getPatchFields().getFieldList());
+    fieldList.add(AUTH_MECHANISM_FIELD);
+
+    for (int attempt = 1; attempt <= MAX_USERNAME_GENERATION_ATTEMPTS; attempt++) {
+      User existingUser = null;
+      try {
+        existingUser = userRepository.getByEmail(null, email, new Fields(fieldList));
+      } catch (EntityNotFoundException e) {
+        LOG.debug("[BootstrapUser] No existing user found for email: {}", email);
+      }
+
+      if (existingUser != null) {
+        if (Boolean.TRUE.equals(existingUser.getIsBot())) {
+          LOG.error(
+              "[BootstrapUser] Cannot promote bot user '{}' to admin. "
+                  + "Bot users cannot be configured as admins.",
+              existingUser.getName());
+          return;
+        }
+
+        if (!Boolean.TRUE.equals(existingUser.getIsAdmin())) {
+          existingUser.setIsAdmin(true);
+          addOrUpdateUser(existingUser);
+          LOG.info("[BootstrapUser] Updated existing user '{}' to admin", existingUser.getName());
+        } else {
+          LOG.debug(
+              "[BootstrapUser] User '{}' is already an admin, no update needed",
+              existingUser.getName());
+        }
+        return;
+      }
+
+      Predicate<String> existsChecker = userRepository::checkUserNameExists;
+      String username = generateUsernameFromEmail(email, existsChecker);
+      String displayName = email.split("@")[0];
+      String password = getPassword(username);
+
+      User newUser =
+          new User()
+              .withId(UUID.randomUUID())
+              .withName(username)
+              .withFullyQualifiedName(EntityInterfaceUtil.quoteName(username))
+              .withEmail(email)
+              .withDisplayName(displayName)
+              .withIsAdmin(true)
+              .withIsBot(false)
+              .withIsEmailVerified(true)
+              .withUpdatedBy(username)
+              .withUpdatedAt(System.currentTimeMillis());
+
+      if (authProvider.equals(AuthProvider.BASIC)) {
+        updateUserWithHashedPwd(newUser, password);
+      }
+
+      try {
+        addOrUpdateUser(newUser);
+        if (authProvider.equals(AuthProvider.BASIC)) {
+          EmailUtil.sendInviteMailToAdmin(newUser, password);
+        }
+        LOG.info("[BootstrapUser] Created new admin user '{}' with email '{}'", username, email);
+        return;
+      } catch (UserCreationException ex) {
+        if (!isRetryableUserCreationConflict(ex) || attempt == MAX_USERNAME_GENERATION_ATTEMPTS) {
+          throw ex;
+        }
+        LOG.warn(
+            "[BootstrapUser] Retrying admin user creation for '{}' after a concurrent create conflict",
+            email);
+      }
+    }
+  }
+
+  public static void createOrUpdateUser(
+      AuthProvider authProvider, String username, String password, String domain, Boolean isAdmin) {
+    UserRepository userRepository = (UserRepository) Entity.getEntityRepository(Entity.USER);
+    User updatedUser = null;
+    try {
+      // Create Required Fields List
+      Set<String> fieldList = new HashSet<>(userRepository.getPatchFields().getFieldList());
+      fieldList.add(AUTH_MECHANISM_FIELD);
+
+      // Fetch Original User, is available
+      User originalUser = userRepository.getByName(null, username, new Fields(fieldList));
+      if (Boolean.FALSE.equals(originalUser.getIsBot())) {
+        updatedUser = originalUser;
+
+        // Update Auth Mechanism if not present, and send mail to the user
+        if (SecurityConfigurationManager.isNativePasswordProvider(authProvider)) {
+          if (originalUser.getAuthenticationMechanism() == null
+              || originalUser.getAuthenticationMechanism().equals(new AuthenticationMechanism())) {
+            updateUserWithHashedPwd(updatedUser, password);
+            EmailUtil.sendInviteMailToAdmin(updatedUser, password);
+          }
+        } else {
+          updatedUser.setAuthenticationMechanism(new AuthenticationMechanism());
+        }
+
+        // Update the specific fields isAdmin
+        updatedUser.setIsAdmin(isAdmin);
+
+        // user email
+        updatedUser.setEmail(String.format("%s@%s", username, domain));
+      } else {
+        if (Boolean.TRUE.equals(originalUser.getIsBot())) {
+          LOG.error(
+              "You configured bot user {} in initialAdmins config. Bot user cannot be promoted to be an admin.",
+              originalUser.getName());
+        }
+      }
+    } catch (EntityNotFoundException e) {
+      updatedUser = user(username, domain, username).withIsAdmin(isAdmin).withIsEmailVerified(true);
+      // Update Auth Mechanism if not present, and send mail to the user
+      if (SecurityConfigurationManager.isNativePasswordProvider(authProvider)) {
+        updateUserWithHashedPwd(updatedUser, password);
+        EmailUtil.sendInviteMailToAdmin(updatedUser, password);
+      }
+    }
+
+    // Update the user
+    if (updatedUser != null) {
+      addOrUpdateUser(updatedUser);
+    }
+  }
+
+  private static String getPassword(String username) {
+    try {
+      if (Boolean.TRUE.equals(EmailUtil.getSmtpSettings().getEnableSmtpServer())
+          && !ADMIN_USER_NAME.equals(username)) {
+        EmailUtil.testConnection();
+        return PasswordUtil.generateRandomPassword();
+      }
+    } catch (Exception ex) {
+      LOG.info("Password set to Default.");
+    }
+    return ADMIN_USER_NAME;
+  }
+
+  public static void updateUserWithHashedPwd(User user, String pwd) {
+    String hashedPwd = BCrypt.withDefaults().hashToString(12, pwd.toCharArray());
+    user.setAuthenticationMechanism(
+        new AuthenticationMechanism()
+            .withAuthType(AuthenticationMechanism.AuthType.BASIC)
+            .withConfig(new BasicAuthMechanism().withPassword(hashedPwd)));
+  }
+
+  /**
+   * Create and persist a ChangeEvent for SSO/LDAP user operations.
+   * Pattern follows TestSuiteRepository.createTestSuiteCompletionChangeEvent()
+   */
+  private static void createUserChangeEvent(User user, EventType eventType) {
+    try {
+      ChangeEvent changeEvent =
+          new ChangeEvent()
+              .withId(UUID.randomUUID())
+              .withEventType(eventType)
+              .withEntityId(user.getId())
+              .withEntityType(Entity.USER)
+              .withEntityFullyQualifiedName(user.getFullyQualifiedName())
+              .withUserName(user.getName())
+              .withTimestamp(user.getUpdatedAt())
+              .withCurrentVersion(user.getVersion())
+              .withPreviousVersion(
+                  user.getChangeDescription() != null
+                      ? user.getChangeDescription().getPreviousVersion()
+                      : (eventType == EventType.ENTITY_CREATED ? null : user.getVersion()))
+              .withEntity(user);
+
+      // Include changeDescription if present (for updates)
+      if (user.getChangeDescription() != null) {
+        changeEvent.withChangeDescription(user.getChangeDescription());
+      }
+
+      // Populate domains if available
+      if (user.getDomains() != null && !user.getDomains().isEmpty()) {
+        changeEvent.withDomains(
+            user.getDomains().stream().map(EntityReference::getId).collect(Collectors.toList()));
+      }
+
+      // Insert directly into change event DAO
+      Entity.getCollectionDAO().changeEventDAO().insert(JsonUtils.pojoToJson(changeEvent));
+    } catch (Exception e) {
+      // Don't fail user creation if ChangeEvent fails
+      LOG.error("Failed to create ChangeEvent for user {}: {}", user.getName(), e.getMessage(), e);
+    }
+  }
+
+  public static User addOrUpdateUser(User user) {
+    UserRepository userRepository = (UserRepository) Entity.getEntityRepository(Entity.USER);
+    try {
+      // Check if user exists BEFORE createOrUpdate to determine event type
+      User existingUser = null;
+      try {
+        existingUser = userRepository.findByNameOrNull(user.getFullyQualifiedName(), NON_DELETED);
+      } catch (Exception e) {
+        // User doesn't exist, will be created
+      }
+      boolean isCreate = (existingUser == null);
+
+      // Perform the actual create/update
+      PutResponse<User> addedUser = userRepository.createOrUpdate(null, user, ADMIN_USER_NAME);
+
+      // Create ChangeEvent for EventSubscription evaluation
+      EventType eventType = isCreate ? EventType.ENTITY_CREATED : EventType.ENTITY_UPDATED;
+      createUserChangeEvent(addedUser.getEntity(), eventType);
+
+      // should not log the user auth details in LOGS
+      LOG.debug("Added user entry: {}", addedUser.getEntity().getName());
+      return addedUser.getEntity();
+    } catch (Exception exception) {
+      // In HA set up the other server may have already added the user.
+      LOG.debug("Caught exception", exception);
+      user.setAuthenticationMechanism(null);
+      throw UserCreationException.byMessage(user.getName(), exception.getMessage());
+    }
+  }
+
+  public static User user(String name, String domain, String updatedBy) {
+    return getUser(
+        updatedBy, new CreateUser().withName(name).withEmail(name + "@" + domain).withIsBot(false));
+  }
+
+  /**
+   * Assigns a user to teams based on the team names from SAML/JWT claims.
+   * Only teams of type "Group" can have users directly assigned via claims.
+   * If a team exists and is of type Group, it will be assigned to the user.
+   * If a team doesn't exist or is not of type Group, it will be logged and ignored.
+   * This method only ADDS teams - it does not remove users from existing teams.
+   */
+  public static boolean assignTeamsFromClaim(User user, List<String> teamNames) {
+    if (nullOrEmpty(teamNames)) {
+      return false;
+    }
+
+    List<EntityReference> currentTeams = user.getTeams();
+    if (currentTeams == null) {
+      currentTeams = new ArrayList<>();
+    } else {
+      currentTeams = new ArrayList<>(currentTeams);
+    }
+
+    boolean anyTeamAssigned = false;
+
+    for (String teamName : teamNames) {
+      if (nullOrEmpty(teamName)) {
+        continue;
+      }
+
+      try {
+        Team team = Entity.getEntityByName(Entity.TEAM, teamName, "id,teamType", NON_DELETED);
+
+        if (team.getTeamType() != CreateTeam.TeamType.GROUP) {
+          LOG.warn(
+              "Team '{}' is of type '{}', not 'Group'. "
+                  + "Users can only be auto-assigned to teams of type 'Group' via claims. "
+                  + "User '{}' will not be assigned to this team.",
+              teamName,
+              team.getTeamType(),
+              user.getName());
+          continue;
+        }
+
+        EntityReference teamRef = team.getEntityReference();
+        boolean teamAlreadyAssigned =
+            currentTeams.stream().anyMatch(t -> t.getId().equals(teamRef.getId()));
+
+        if (!teamAlreadyAssigned) {
+          currentTeams.add(teamRef);
+          anyTeamAssigned = true;
+          LOG.info("Assigned team '{}' to user '{}' from claim", teamName, user.getName());
+        }
+      } catch (EntityNotFoundException e) {
+        LOG.warn(
+            "Team '{}' from claim mapping not found in OpenMetadata. "
+                + "User '{}' will not be assigned to this team.",
+            teamName,
+            user.getName());
+      } catch (Exception e) {
+        LOG.error(
+            "Error assigning team '{}' to user '{}': {}",
+            teamName,
+            user.getName(),
+            e.getMessage(),
+            e);
+      }
+    }
+
+    if (anyTeamAssigned) {
+      user.setTeams(currentTeams);
+    }
+
+    return anyTeamAssigned;
+  }
+
+  /**
+   * Create or update a bot user using the botDomain from AuthorizerConfiguration.
+   *
+   * @param botName name of the bot
+   * @param authConfig authorizer configuration containing botDomain
+   * @return created or updated bot user
+   */
+  public static User addOrUpdateBotUser(String botName, AuthorizerConfiguration authConfig) {
+    if (nullOrEmpty(botName)) {
+      throw new IllegalArgumentException("Bot name cannot be null or empty");
+    }
+    if (authConfig == null) {
+      throw new IllegalArgumentException("AuthorizerConfiguration cannot be null");
+    }
+    String botDomain = authConfig.getBotDomain();
+    if (nullOrEmpty(botDomain)) {
+      botDomain = authConfig.getPrincipalDomain();
+    }
+    if (nullOrEmpty(botDomain)) {
+      botDomain = SecurityUtil.DEFAULT_PRINCIPAL_DOMAIN;
+    }
+
+    String botEmail = createBotEmail(botName, botDomain);
+    User user =
+        new User()
+            .withId(UUID.randomUUID())
+            .withName(botName.toLowerCase())
+            .withFullyQualifiedName(EntityInterfaceUtil.quoteName(botName.toLowerCase()))
+            .withEmail(botEmail)
+            .withIsBot(true)
+            .withIsAdmin(false)
+            .withUpdatedBy(botName.toLowerCase())
+            .withUpdatedAt(System.currentTimeMillis());
+
+    return addOrUpdateBotUser(user);
+  }
+
+  /**
+   * This method add auth mechanism in the following way:
+   *
+   * <ul>
+   *   <li>If original user has already an authMechanism, add it to the user
+   *   <li>Otherwise:
+   *       <ul>
+   *         <li>If airflow configuration is 'openmetadata' and server auth provider is not basic, add JWT auth
+   *             mechanism from Airflow configuration
+   *         <li>Otherwise:
+   *             <ul>
+   *               <li>If airflow configuration is 'basic', add JWT auth mechanism with a generated token which does not
+   *                   expire
+   *               <li>Otherwise, add SSO auth mechanism from Airflow configuration
+   *             </ul>
+   *       </ul>
+   * </ul>
+   */
+  public static User addOrUpdateBotUser(User user) {
+    User originalUser = retrieveWithAuthMechanism(user);
+    AuthenticationMechanism authMechanism =
+        originalUser != null ? originalUser.getAuthenticationMechanism() : null;
+    // the user did not have an auth mechanism and auth config is present
+    if (authMechanism == null) {
+      authMechanism = buildAuthMechanism(JWT, buildJWTAuthMechanism(null, user));
+    }
+    user.setAuthenticationMechanism(authMechanism);
+    user.setDescription(user.getDescription());
+    user.setDisplayName(user.getDisplayName());
+    return addOrUpdateUser(user);
+  }
+
+  private static JWTAuthMechanism buildJWTAuthMechanism(
+      OpenMetadataJWTClientConfig jwtClientConfig, User user) {
+    return Objects.isNull(jwtClientConfig) || nullOrEmpty(jwtClientConfig.getJwtToken())
+        ? JWTTokenGenerator.getInstance().generateJWTToken(user, JWTTokenExpiry.Unlimited)
+        : new JWTAuthMechanism()
+            .withJWTToken(jwtClientConfig.getJwtToken())
+            .withJWTTokenExpiry(JWTTokenExpiry.Unlimited);
+  }
+
+  private static AuthenticationMechanism buildAuthMechanism(
+      AuthenticationMechanism.AuthType authType, Object config) {
+    return new AuthenticationMechanism().withAuthType(authType).withConfig(config);
+  }
+
+  private static User retrieveWithAuthMechanism(User user) {
+    EntityRepository<User> userRepository =
+        (UserRepository) Entity.getEntityRepository(Entity.USER);
+    try {
+      return userRepository.getByName(
+          null, user.getName(), new Fields(Set.of("authenticationMechanism")));
+    } catch (EntityNotFoundException e) {
+      LOG.debug("Bot entity: {} does not exists.", user);
+      return null;
+    }
+  }
+
+  public static EntityReference getUserOrBot(String name) {
+    EntityReference userOrBot;
+    try {
+      userOrBot = Entity.getEntityReferenceByName(Entity.USER, name, NON_DELETED);
+    } catch (EntityNotFoundException e) {
+      userOrBot = Entity.getEntityReferenceByName(Entity.BOT, name, NON_DELETED);
+    }
+    return userOrBot;
+  }
+
+  public static Set<String> getRoleListFromUser(User user) {
+    if (nullOrEmpty(user.getRoles())) {
+      return new HashSet<>();
+    }
+    return listOrEmpty(user.getRoles()).stream()
+        .map(EntityReference::getName)
+        .collect(Collectors.toSet());
+  }
+
+  public static List<EntityReference> validateAndGetRolesRef(Set<String> rolesList) {
+    if (nullOrEmpty(rolesList)) {
+      return Collections.emptyList();
+    }
+    List<EntityReference> references = new ArrayList<>();
+
+    // Fetch the roles from the database
+    for (String role : rolesList) {
+      // Admin role is not present in the roles table, it is just a flag in the user table
+      if (!role.equals(ADMIN_ROLE)) {
+        try {
+          Role fetchedRole = Entity.getEntityByName(Entity.ROLE, role, "id", NON_DELETED, true);
+          references.add(fetchedRole.getEntityReference());
+        } catch (EntityNotFoundException ex) {
+          LOG.error("[ReSyncRoles] Role not found: {}", role, ex);
+        }
+      }
+    }
+    return references;
+  }
+
+  // The raw accessor, not getUserRoles(): the latter normalizes null to an empty set, which would
+  // make "no roles claim in the token" indistinguishable from "the provider revoked every role".
+  public static Set<String> getRolesFromAuthorizationToken(
+      CatalogSecurityContext catalogSecurityContext) {
+    return catalogSecurityContext.userRoles();
+  }
+
+  public static boolean isRolesSyncNeeded(Set<String> fromToken, Set<String> fromDB) {
+    // Check if there are roles in the token that are not present in the DB
+    for (String role : fromToken) {
+      if (!fromDB.contains(role)) {
+        return true;
+      }
+    }
+
+    // Check if there are roles in the DB that are not present in the token
+    for (String role : fromDB) {
+      if (!fromToken.contains(role)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Syncs a user's roles to what the identity provider reported. {@code rolesFromToken} is
+   * authoritative when non-null, including when empty - that is the provider revoking every role. A
+   * null set means the provider said nothing (no roles claim, or the feature is off) and the user's
+   * OpenMetadata roles are left alone.
+   *
+   * <p>Admin is promotion-only. Demoting on a missing admin role would lock out anyone who is an
+   * admin through the {@code adminPrincipals} configuration rather than through the provider.
+   */
+  public static boolean reSyncUserRolesFromToken(
+      UriInfo uriInfo, User user, Set<String> rolesFromToken) {
+    if (rolesFromToken == null) {
+      return false;
+    }
+    boolean syncUser = false;
+    Set<String> mutableRolesFromToken = new HashSet<>(rolesFromToken);
+
+    User updatedUser = JsonUtils.deepCopy(user, User.class);
+    // Check if Admin User
+    if (mutableRolesFromToken.contains(ADMIN_ROLE)) {
+      if (Boolean.FALSE.equals(user.getIsAdmin())) {
+        syncUser = true;
+        updatedUser.setIsAdmin(true);
+      }
+
+      // Remove the Admin Role from the list
+      mutableRolesFromToken.remove(ADMIN_ROLE);
+    }
+
+    Set<String> rolesFromUser = getRoleListFromUser(user);
+
+    // Check if roles are different
+    if (isRolesSyncNeeded(mutableRolesFromToken, rolesFromUser)) {
+      syncUser = true;
+      List<EntityReference> rolesReferenceFromToken = validateAndGetRolesRef(mutableRolesFromToken);
+      updatedUser.setRoles(rolesReferenceFromToken);
+    }
+
+    if (syncUser) {
+      LOG.info("Syncing User Roles for User: {}", user.getName());
+      JsonPatch patch = JsonUtils.getJsonPatch(user, updatedUser);
+
+      UserRepository userRepository = (UserRepository) Entity.getEntityRepository(Entity.USER);
+      userRepository.patch(uriInfo, user.getId(), user.getName(), patch);
+
+      // Set the updated roles to the original user
+      user.setRoles(updatedUser.getRoles());
+      user.setIsAdmin(updatedUser.getIsAdmin());
+    }
+
+    return syncUser;
+  }
+
+  public static User getUser(String updatedBy, CreateUser create) {
+    return new User()
+        .withId(UUID.randomUUID())
+        .withName(create.getName().toLowerCase())
+        .withFullyQualifiedName(EntityInterfaceUtil.quoteName(create.getName().toLowerCase()))
+        .withEmail(create.getEmail().toLowerCase())
+        .withDescription(create.getDescription())
+        .withDisplayName(create.getDisplayName())
+        .withIsBot(create.getIsBot())
+        .withIsAdmin(create.getIsAdmin())
+        .withProfile(create.getProfile())
+        .withPersonas(create.getPersonas())
+        .withDefaultPersona(create.getDefaultPersona())
+        .withTimezone(create.getTimezone())
+        .withUpdatedBy(updatedBy.toLowerCase())
+        .withUpdatedAt(System.currentTimeMillis())
+        .withTeams(EntityUtil.toEntityReferences(create.getTeams(), Entity.TEAM))
+        .withRoles(EntityUtil.toEntityReferences(create.getRoles(), Entity.ROLE))
+        .withDomains(EntityUtil.getEntityReferences(Entity.DOMAIN, create.getDomains()))
+        .withExternalId(create.getExternalId())
+        .withScimUserName(create.getScimUserName());
+  }
+
+  /**
+   * Check if email is in the admin emails list.
+   *
+   * @param email user's email address
+   * @param adminEmails list of admin email addresses
+   * @return true if email is an admin email
+   */
+  public static boolean isAdminEmail(String email, List<String> adminEmails) {
+    if (nullOrEmpty(email)) {
+      return false;
+    }
+    if (adminEmails == null || adminEmails.isEmpty()) {
+      return false;
+    }
+
+    String normalizedEmail = email.toLowerCase();
+    return adminEmails.stream()
+        .anyMatch(adminEmail -> adminEmail.equalsIgnoreCase(normalizedEmail));
+  }
+
+  /**
+   * Decide whether a login should be an admin, from configuration alone. Checks the preferred
+   * 'adminEmails' first and falls back to the deprecated 'adminPrincipals' username list, so the
+   * OIDC, SAML and LDAP handlers all resolve admin status identically.
+   *
+   * @param authConfig authorizer configuration (may be null)
+   * @param email the authenticated user's email
+   * @param username the resolved OpenMetadata username
+   * @return true when either configuration marks this login as an admin
+   */
+  public static boolean isConfiguredAdmin(
+      AuthorizerConfiguration authConfig, String email, String username) {
+    if (authConfig == null) {
+      return false;
+    }
+    Set<String> adminEmails = authConfig.getAdminEmails();
+    if (adminEmails != null && isAdminEmail(email, new ArrayList<>(adminEmails))) {
+      return true;
+    }
+    Set<String> adminPrincipals = authConfig.getAdminPrincipals();
+    return adminPrincipals != null && adminPrincipals.contains(username);
+  }
+
+  /**
+   * Create email address for a system bot.
+   *
+   * @param botName name of the bot
+   * @param botDomain domain for bot emails
+   * @return bot email address
+   */
+  public static String createBotEmail(String botName, String botDomain) {
+    if (nullOrEmpty(botName)) {
+      throw new IllegalArgumentException("Bot name cannot be null or empty");
+    }
+    if (nullOrEmpty(botDomain)) {
+      throw new IllegalArgumentException("Bot domain cannot be null or empty");
+    }
+    return String.format("%s@%s", botName.toLowerCase(), botDomain.toLowerCase());
+  }
+
+  public static void validateUserPersonaPreferencesImage(LandingPageSettings settings) {
+    if (settings.getHeaderImage() != null && !settings.getHeaderImage().isEmpty()) {
+      try {
+        new URI(settings.getHeaderImage());
+        if (!settings.getHeaderImage().startsWith("http://")
+            && !settings.getHeaderImage().startsWith("https://")) {
+          throw new BadRequestException("Header image must be a valid HTTP or HTTPS URL");
+        }
+      } catch (URISyntaxException e) {
+        throw new BadRequestException("Header image must be a valid URL: " + e.getMessage());
+      }
+    }
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "name": "tableColumnCountToBeBetween",
+  "fullyQualifiedName": "tableColumnCountToBeBetween",
+  "displayName": "Table Column Count To Be Between",
+  "description": "This schema defines the test TableColumnCountToBeBetween. Test the number of columns to be between min max value.",
+  "entityType": "TABLE",
+  "testPlatforms": ["OpenMetadata"],
+  "parameterDefinition": [
+    {
+      "name": "minColValue",
+      "displayName": "Min",
+      "description": "Expected number of columns should be greater than or equal to {minValue}. If minValue is not included, maxValue is treated as upperBound and there will be no minimum number of column",
+      "dataType": "INT",
+      "validationRule": {
+        "parameterField": "maxColValue",
+        "rule": "LESS_THAN_OR_EQUALS"
+      }
+    },
+    {
+      "name": "maxColValue",
+      "displayName": "Max",
+      "description": "Expected number of columns should be less than or equal to {maxValue}. If maxValue is not included, minValue is treated as lowerBound and there will be no maximum number of column",
+      "dataType": "INT",
+      "validationRule": {
+          "parameterField": "minColValue",
+          "rule": "GREATER_THAN_OR_EQUALS"
+      }
+    },
+    {
+      "name": "threshold",
+      "displayName": "Failure Threshold",
+      "description": "Number of failures tolerated before the test is marked as failed. Read as an absolute count or as a percentage depending on `thresholdUnit` (defaults to 0).",
+      "dataType": "NUMBER",
+      "required": false
+    },
+    {
+      "name": "thresholdUnit",
+      "displayName": "Threshold Unit",
+      "description": "How to read `threshold`: `ABSOLUTE` for a raw count of failures, `PERCENTAGE` for a share of the evaluated rows (defaults to ABSOLUTE).",
+      "dataType": "STRING",
+      "required": false,
+      "optionValues": ["ABSOLUTE", "PERCENTAGE"]
+    }
+  ],
+  "provider": "system",
+  "enabled": true,
+  "dataQualityDimension": "Integrity",
+  "validatorClass": "TableColumnCountToBeBetweenValidator"
+}

@@ -1,0 +1,36 @@
+{
+  "name": "tableRowCountToEqual",
+  "fullyQualifiedName": "tableRowCountToEqual",
+  "displayName": "Table Row Count To Equal",
+  "description": "This schema defines the test TableRowCountToEqual. Test the number of rows equal to a value.",
+  "entityType": "TABLE",
+  "testPlatforms": ["OpenMetadata"],
+  "parameterDefinition": [
+    {
+      "name": "value",
+      "displayName": "Count",
+      "description": "Expected number of rows to be equal to {Count}",
+      "dataType": "INT",
+      "required": true
+    },
+    {
+      "name": "threshold",
+      "displayName": "Failure Threshold",
+      "description": "Number of failures tolerated before the test is marked as failed. Read as an absolute count or as a percentage depending on `thresholdUnit` (defaults to 0).",
+      "dataType": "NUMBER",
+      "required": false
+    },
+    {
+      "name": "thresholdUnit",
+      "displayName": "Threshold Unit",
+      "description": "How to read `threshold`: `ABSOLUTE` for a raw count of failures, `PERCENTAGE` for a share of the evaluated rows (defaults to ABSOLUTE).",
+      "dataType": "STRING",
+      "required": false,
+      "optionValues": ["ABSOLUTE", "PERCENTAGE"]
+    }
+  ],
+  "provider": "system",
+  "enabled": true,
+  "dataQualityDimension": "Integrity",
+  "validatorClass": "TableRowCountToEqualValidator"
+}

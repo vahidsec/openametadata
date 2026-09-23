@@ -1,0 +1,681 @@
+package org.openmetadata.service.apps.bundles.dataRetention;
+
+import static org.openmetadata.service.apps.scheduler.OmAppJobListener.APP_RUN_STATS;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.IntPredicate;
+import java.util.function.Supplier;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.exception.ExceptionUtils;
+import org.jdbi.v3.sqlobject.transaction.Transaction;
+import org.openmetadata.common.utils.CommonUtil;
+import org.openmetadata.schema.entity.app.App;
+import org.openmetadata.schema.entity.app.AppRunRecord;
+import org.openmetadata.schema.entity.app.FailureContext;
+import org.openmetadata.schema.entity.applications.configuration.internal.DataRetentionConfiguration;
+import org.openmetadata.schema.system.EntityStats;
+import org.openmetadata.schema.system.IndexingError;
+import org.openmetadata.schema.system.Stats;
+import org.openmetadata.schema.system.StepStats;
+import org.openmetadata.schema.utils.JsonUtils;
+import org.openmetadata.service.Entity;
+import org.openmetadata.service.apps.AbstractNativeApplication;
+import org.openmetadata.service.jdbi3.CollectionDAO;
+import org.openmetadata.service.jdbi3.EntityTimeSeriesDAO;
+import org.openmetadata.service.jdbi3.WorkflowDocStoreDAOs;
+import org.openmetadata.service.search.SearchRepository;
+import org.openmetadata.service.socket.WebSocketManager;
+import org.openmetadata.service.util.EntityRelationshipCleanupUtil;
+import org.openmetadata.service.util.OrphanIngestionPipelineCleanup;
+import org.openmetadata.service.util.OrphanTestCaseCleanup;
+import org.openmetadata.service.util.OrphanTestCaseRelationshipCleanup;
+import org.openmetadata.service.util.TagUsageCleanup;
+import org.quartz.JobExecutionContext;
+
+@Slf4j
+public class DataRetention extends AbstractNativeApplication {
+  private static final int BATCH_SIZE = 10_000;
+
+  /**
+   * Per-run ceiling on workflow deletions. Unlike the bulk-SQL cleanups, each delete here costs a
+   * repository round-trip plus a {@code deleteSecretsFromWorkflow} call, which reaches an external
+   * secrets manager over the network on AWS/Azure setups. Draining a large first-run backlog in one
+   * go would run for hours and risk that provider's rate limits, so a backlog is spread over
+   * several weekly runs instead.
+   */
+  private static final int MAX_WORKFLOW_DELETES_PER_RUN = 100_000;
+
+  private DataRetentionConfiguration dataRetentionConfiguration;
+  private final CollectionDAO.EventSubscriptionDAO eventSubscriptionDAO;
+  private final Stats retentionStats = new Stats();
+  private JobExecutionContext jobExecutionContext;
+
+  private AppRunRecord.Status internalStatus = AppRunRecord.Status.COMPLETED;
+  private IndexingError failureDetails = null;
+
+  private final EntityTimeSeriesDAO testCaseResultsDAO;
+  private final EntityTimeSeriesDAO profileDataDAO;
+  private final CollectionDAO.AuditLogDAO auditLogDAO;
+  private final WorkflowDocStoreDAOs.WorkflowDAO workflowDAO;
+
+  private final DataRetentionExtensionRegistry extensionRegistry;
+
+  public DataRetention(CollectionDAO collectionDAO, SearchRepository searchRepository) {
+    super(collectionDAO, searchRepository);
+    this.eventSubscriptionDAO = collectionDAO.eventSubscriptionDAO();
+    this.testCaseResultsDAO = collectionDAO.testCaseResultTimeSeriesDao();
+    this.profileDataDAO = collectionDAO.profilerDataTimeSeriesDao();
+    this.auditLogDAO = collectionDAO.auditLogDAO();
+    this.workflowDAO = collectionDAO.workflowDAO();
+    this.extensionRegistry = DataRetentionExtensionRegistry.discover();
+  }
+
+  @Override
+  public void init(App app) {
+    super.init(app);
+    this.dataRetentionConfiguration =
+        JsonUtils.convertValue(app.getAppConfiguration(), DataRetentionConfiguration.class);
+    if (CommonUtil.nullOrEmpty(this.dataRetentionConfiguration)) {
+      LOG.warn("No retention policy configuration provided. Cleanup tasks will not run.");
+    }
+  }
+
+  @Override
+  public void startApp(JobExecutionContext jobExecutionContext) {
+    this.jobExecutionContext = jobExecutionContext;
+
+    try {
+      initializeStatsDefaults();
+      executeCleanup(dataRetentionConfiguration);
+
+      jobExecutionContext.getJobDetail().getJobDataMap().put(APP_RUN_STATS, retentionStats);
+      updateRecordToDbAndNotify(null);
+
+      if (internalStatus == AppRunRecord.Status.ACTIVE_ERROR
+          || internalStatus == AppRunRecord.Status.FAILED) {
+        throw new RuntimeException("Partial failure occurred in DataRetention job");
+      }
+
+    } catch (Exception ex) {
+      LOG.error("DataRetention job failed.", ex);
+      internalStatus = AppRunRecord.Status.FAILED;
+
+      failureDetails = toIndexingError(ex);
+
+      updateRecordToDbAndNotify(ex);
+    }
+  }
+
+  private void initializeStatsDefaults() {
+    StepStats jobStats =
+        new StepStats().withTotalRecords(0).withSuccessRecords(0).withFailedRecords(0);
+    retentionStats.setJobStats(jobStats);
+
+    EntityStats entityStats = new EntityStats();
+    entityStats.withAdditionalProperty("successful_sent_change_events", new StepStats());
+    entityStats.withAdditionalProperty("change_events", new StepStats());
+    entityStats.withAdditionalProperty("consumers_dlq", new StepStats());
+    entityStats.withAdditionalProperty("activity_threads", new StepStats());
+    entityStats.withAdditionalProperty("activity_comments", new StepStats());
+
+    // Add stats for relationship and hierarchy cleanup
+    entityStats.withAdditionalProperty("orphaned_relationships", new StepStats());
+    entityStats.withAdditionalProperty("broken_database_entities", new StepStats());
+    entityStats.withAdditionalProperty("broken_dashboard_entities", new StepStats());
+    entityStats.withAdditionalProperty("broken_api_entities", new StepStats());
+    entityStats.withAdditionalProperty("broken_messaging_entities", new StepStats());
+    entityStats.withAdditionalProperty("broken_pipeline_entities", new StepStats());
+    entityStats.withAdditionalProperty("broken_storage_entities", new StepStats());
+    entityStats.withAdditionalProperty("broken_mlmodel_entities", new StepStats());
+    entityStats.withAdditionalProperty("broken_search_entities", new StepStats());
+    entityStats.withAdditionalProperty("orphaned_tag_usages", new StepStats());
+    entityStats.withAdditionalProperty("orphaned_test_cases", new StepStats());
+    entityStats.withAdditionalProperty("test_cases_missing_test_definition", new StepStats());
+    entityStats.withAdditionalProperty("test_cases_missing_executable_suite", new StepStats());
+    entityStats.withAdditionalProperty("orphaned_ingestion_pipelines", new StepStats());
+    entityStats.withAdditionalProperty("orphan_test_case_resolution_status", new StepStats());
+    entityStats.withAdditionalProperty("orphan_agent_execution", new StepStats());
+    entityStats.withAdditionalProperty("orphan_mcp_execution", new StepStats());
+    entityStats.withAdditionalProperty("orphan_profile_data", new StepStats());
+    entityStats.withAdditionalProperty("orphan_query_cost_time_series", new StepStats());
+    entityStats.withAdditionalProperty("audit_logs", new StepStats());
+    entityStats.withAdditionalProperty("automation_workflows", new StepStats());
+
+    retentionStats.setEntityStats(entityStats);
+  }
+
+  public void executeCleanup(DataRetentionConfiguration config) {
+    if (config == null) {
+      LOG.warn("DataRetentionConfiguration is null. Skipping cleanup.");
+      return;
+    }
+
+    // Clean up orphaned relationships and broken service hierarchies
+    LOG.info("Starting cleanup for orphaned relationships and broken service hierarchies.");
+    cleanOrphanedRelationshipsAndHierarchies();
+
+    // Clean up orphaned tag usages
+    LOG.info("Starting cleanup for orphaned tag usages.");
+    cleanOrphanedTagUsages();
+
+    // Clean up test cases whose entityLink targets a deleted entity. Relationship cleanup above
+    // removes broken test_suite -> test_case rows, but it can't reason about the string-based
+    // entityLink that the test case carries. Run this after relationship cleanup so we don't
+    // delete a test case whose suite has just been restored from a relationship row.
+    LOG.info("Starting cleanup for orphan test cases.");
+    cleanOrphanTestCases();
+
+    // Clean up test cases whose core relationship rows are gone: no testDefinition link (breaks
+    // search indexing) or no live executable test suite ("No executable test suite was found").
+    // Runs after the relationship/hierarchy cleanup above so a suite relationship that was just
+    // repaired is not mistaken for missing.
+    LOG.info("Starting cleanup for test cases with missing relationships.");
+    cleanTestCasesWithMissingRelationships();
+
+    // Clean up ingestion pipelines whose container (service/test suite) CONTAINS row is gone. Such
+    // a pipeline can never run and breaks search indexing ("does not have expected relationship
+    // contains to/from entity type null"). Runs after the relationship/hierarchy cleanup above so a
+    // container relationship that was just repaired is not mistaken for missing.
+    LOG.info("Starting cleanup for orphaned ingestion pipelines.");
+    cleanOrphanedIngestionPipelines();
+
+    // Run after orphan test case cleanup so resolution-status rows for deleted test cases
+    // also get swept up.
+    LOG.info("Starting cleanup for orphaned time-series rows.");
+    cleanOrphanedTimeSeriesRows();
+
+    int retentionPeriod = config.getChangeEventRetentionPeriod();
+    LOG.info("Starting cleanup for change events with retention period: {} days.", retentionPeriod);
+    cleanChangeEvents(retentionPeriod);
+
+    Integer threadRetentionPeriod = config.getActivityThreadsRetentionPeriod();
+    if (isRetentionEnabled(threadRetentionPeriod)) {
+      LOG.info(
+          "Starting cleanup for activity threads with retention period: {} days.",
+          threadRetentionPeriod);
+      cleanActivityThreads(threadRetentionPeriod);
+    } else {
+      LOG.info("Activity threads are retained indefinitely.");
+    }
+
+    Integer activityCommentsRetentionPeriod = config.getActivityCommentsRetentionPeriod();
+    if (isRetentionEnabled(activityCommentsRetentionPeriod)) {
+      LOG.info(
+          "Starting cleanup for activity comments with retention period: {} days.",
+          activityCommentsRetentionPeriod);
+      cleanActivityComments(activityCommentsRetentionPeriod);
+    } else {
+      LOG.info("Activity comments are retained indefinitely.");
+    }
+
+    int testCaseResultsRetentionPeriod = config.getTestCaseResultsRetentionPeriod();
+    LOG.info(
+        "Starting cleanup for test case results with retention period: {} days.",
+        testCaseResultsRetentionPeriod);
+    cleanTestCaseResults(testCaseResultsRetentionPeriod);
+
+    int profileDataRetentionPeriod = config.getProfileDataRetentionPeriod();
+    LOG.info(
+        "Starting cleanup for profile data with retention period: {} days.",
+        profileDataRetentionPeriod);
+    cleanProfileData(profileDataRetentionPeriod);
+
+    int auditLogRetentionPeriod = config.getAuditLogRetentionPeriod();
+    LOG.info(
+        "Starting cleanup for audit logs with retention period: {} days.", auditLogRetentionPeriod);
+    cleanAuditLogs(auditLogRetentionPeriod);
+
+    Integer workflowRetentionPeriod = config.getWorkflowRetentionPeriod();
+    if (isRetentionEnabled(workflowRetentionPeriod)) {
+      LOG.info(
+          "Starting cleanup for automation workflows with retention period: {} days.",
+          workflowRetentionPeriod);
+      cleanAutomationWorkflows(workflowRetentionPeriod);
+    } else {
+      LOG.info("Automation workflows are retained indefinitely.");
+    }
+
+    LOG.info("Starting cleanup for registered retention extensions.");
+    cleanExtensions(config);
+  }
+
+  /** Runs every {@link DataRetentionExtension} on the classpath, after the built-in cleanups. */
+  private void cleanExtensions(DataRetentionConfiguration config) {
+    List<RetentionStep> steps =
+        extensionRegistry.resolveSteps(config, this::recordExtensionFailure);
+
+    for (RetentionStep step : steps) {
+      LOG.info("Initiating extension cleanup: {}.", step.statsKey());
+      executeWithStatsTracking(step.statsKey(), () -> step.deleter().deleteBatch(BATCH_SIZE));
+    }
+
+    LOG.info("Extension cleanup complete for {} step(s).", steps.size());
+  }
+
+  private void recordExtensionFailure(Throwable ex) {
+    internalStatus = AppRunRecord.Status.ACTIVE_ERROR;
+    recordFirstFailure(ex);
+  }
+
+  @Transaction
+  private void cleanActivityThreads(int retentionPeriod) {
+    LOG.info("Initiating activity threads cleanup: Retention = {} days.", retentionPeriod);
+    long cutoffMillis = getRetentionCutoffMillis(retentionPeriod);
+
+    executeWithStatsTracking(
+        "activity_threads",
+        () ->
+            Entity.getConversationRepository()
+                .deleteExpiredUserConversations(cutoffMillis, BATCH_SIZE));
+
+    LOG.info("Activity threads cleanup complete.");
+  }
+
+  @Transaction
+  private void cleanActivityComments(int retentionPeriod) {
+    LOG.info("Initiating activity comments cleanup: Retention = {} days.", retentionPeriod);
+    long cutoffMillis = getRetentionCutoffMillis(retentionPeriod);
+
+    executeWithStatsTracking(
+        "activity_comments",
+        () ->
+            Entity.getConversationRepository()
+                .deleteExpiredActivityConversations(cutoffMillis, BATCH_SIZE));
+
+    LOG.info("Activity comments cleanup complete.");
+  }
+
+  @Transaction
+  private void cleanChangeEvents(int retentionPeriod) {
+    LOG.info("Initiating change events cleanup: Retention = {} days.", retentionPeriod);
+    long cutoffMillis = getRetentionCutoffMillis(retentionPeriod);
+
+    executeWithStatsTracking(
+        "successful_sent_change_events",
+        () ->
+            eventSubscriptionDAO.deleteSuccessfulSentChangeEventsInBatches(
+                cutoffMillis, BATCH_SIZE));
+
+    executeWithStatsTracking(
+        "change_events",
+        () -> eventSubscriptionDAO.deleteChangeEventsInBatches(cutoffMillis, BATCH_SIZE));
+
+    executeWithStatsTracking(
+        "consumers_dlq",
+        () -> eventSubscriptionDAO.deleteConsumersDlqInBatches(cutoffMillis, BATCH_SIZE));
+
+    LOG.info("Change events cleanup complete.");
+  }
+
+  @Transaction
+  private void cleanOrphanedRelationshipsAndHierarchies() {
+    LOG.info("Initiating orphaned relationships and broken service hierarchies cleanup.");
+
+    try {
+      // Perform comprehensive cleanup using the reusable utility
+      EntityRelationshipCleanupUtil cleanup =
+          EntityRelationshipCleanupUtil.forActualCleanup(collectionDAO, BATCH_SIZE);
+      EntityRelationshipCleanupUtil.CleanupResult result = cleanup.performComprehensiveCleanup();
+
+      // Update stats for orphaned relationships
+      updateStats(
+          "orphaned_relationships", result.getRelationshipResult().getRelationshipsDeleted(), 0);
+
+      // Update stats for each service type
+      for (Map.Entry<String, Integer> entry :
+          result.getHierarchyResult().getDeletedEntitiesByService().entrySet()) {
+        String serviceName = entry.getKey();
+        int deletedCount = entry.getValue();
+        String statsKey = "broken_" + serviceName.toLowerCase() + "_entities";
+        updateStats(statsKey, deletedCount, 0);
+      }
+
+      LOG.info(
+          "Cleanup completed - Relationships: {}, Hierarchies: {}",
+          result.getRelationshipResult().getRelationshipsDeleted(),
+          result.getHierarchyResult().getTotalBrokenDeleted());
+
+    } catch (Exception ex) {
+      LOG.error("Failed to clean orphaned relationships and hierarchies", ex);
+      internalStatus = AppRunRecord.Status.ACTIVE_ERROR;
+
+      recordFirstFailure(ex);
+    }
+  }
+
+  private void cleanOrphanedTagUsages() {
+    LOG.info("Initiating orphaned tag usages cleanup.");
+
+    try {
+      TagUsageCleanup cleanup = new TagUsageCleanup(collectionDAO, false);
+      TagUsageCleanup.TagCleanupResult result = cleanup.performCleanup(BATCH_SIZE);
+
+      updateStats("orphaned_tag_usages", result.getTagUsagesDeleted(), 0);
+
+      LOG.info("Tag usage cleanup completed - Deleted: {}", result.getTagUsagesDeleted());
+
+    } catch (Exception ex) {
+      LOG.error("Failed to clean orphaned tag usages", ex);
+      internalStatus = AppRunRecord.Status.ACTIVE_ERROR;
+
+      recordFirstFailure(ex);
+    }
+  }
+
+  private void cleanOrphanTestCases() {
+    try {
+      OrphanTestCaseCleanup cleanup = new OrphanTestCaseCleanup(collectionDAO, false);
+      OrphanTestCaseCleanup.OrphanTestCaseResult result = cleanup.performCleanup(BATCH_SIZE);
+      updateStats("orphaned_test_cases", result.getOrphansDeleted(), result.getFailures());
+      LOG.info(
+          "Orphan test case cleanup completed - Scanned: {}, Found: {}, Deleted: {}, Failed: {}",
+          result.getTotalScanned(),
+          result.getOrphansFound(),
+          result.getOrphansDeleted(),
+          result.getFailures());
+    } catch (Exception ex) {
+      LOG.error("Failed to clean orphan test cases", ex);
+      internalStatus = AppRunRecord.Status.ACTIVE_ERROR;
+      recordFirstFailure(ex);
+    }
+  }
+
+  private void cleanTestCasesWithMissingRelationships() {
+    try {
+      OrphanTestCaseRelationshipCleanup cleanup =
+          new OrphanTestCaseRelationshipCleanup(collectionDAO, false);
+      OrphanTestCaseRelationshipCleanup.Result result = cleanup.performCleanup(BATCH_SIZE);
+      updateStats(
+          "test_cases_missing_test_definition",
+          result.getMissingTestDefinitionDeleted(),
+          result.getMissingTestDefinitionFailures());
+      updateStats(
+          "test_cases_missing_executable_suite",
+          result.getMissingExecutableSuiteDeleted(),
+          result.getMissingExecutableSuiteFailures());
+      LOG.info(
+          "Test case relationship cleanup completed - Scanned: {}, Missing-definition deleted: {}, "
+              + "failed: {}, Missing-executable-suite deleted: {}, failed: {}",
+          result.getTotalScanned(),
+          result.getMissingTestDefinitionDeleted(),
+          result.getMissingTestDefinitionFailures(),
+          result.getMissingExecutableSuiteDeleted(),
+          result.getMissingExecutableSuiteFailures());
+    } catch (Exception ex) {
+      LOG.error("Failed to clean test cases with missing relationships", ex);
+      internalStatus = AppRunRecord.Status.ACTIVE_ERROR;
+      recordFirstFailure(ex);
+    }
+  }
+
+  private void cleanOrphanedIngestionPipelines() {
+    try {
+      OrphanIngestionPipelineCleanup cleanup =
+          new OrphanIngestionPipelineCleanup(collectionDAO, false);
+      OrphanIngestionPipelineCleanup.Result result = cleanup.performCleanup(BATCH_SIZE);
+      updateStats(
+          "orphaned_ingestion_pipelines", result.getOrphansDeleted(), result.getOrphanFailures());
+      LOG.info(
+          "Orphan ingestion pipeline cleanup completed - Scanned: {}, Deleted: {}, Failed: {}",
+          result.getTotalScanned(),
+          result.getOrphansDeleted(),
+          result.getOrphanFailures());
+    } catch (Exception ex) {
+      LOG.error("Failed to clean orphan ingestion pipelines", ex);
+      internalStatus = AppRunRecord.Status.ACTIVE_ERROR;
+      if (failureDetails == null) {
+        failureDetails = new IndexingError();
+        failureDetails.setMessage(ex.getMessage());
+        failureDetails.setStackTrace(ExceptionUtils.getStackTrace(ex));
+      }
+    }
+  }
+
+  private void cleanOrphanedTimeSeriesRows() {
+    LOG.info("Initiating orphaned time-series rows cleanup.");
+
+    CollectionDAO.TestCaseResolutionStatusTimeSeriesDAO resolutionStatusDao =
+        collectionDAO.testCaseResolutionStatusTimeSeriesDao();
+    CollectionDAO.AgentExecutionDAO agentExecutionDao = collectionDAO.agentExecutionDAO();
+    CollectionDAO.McpExecutionDAO mcpExecutionDao = collectionDAO.mcpExecutionDAO();
+    CollectionDAO.ProfilerDataTimeSeriesDAO profilerDao = collectionDAO.profilerDataTimeSeriesDao();
+    CollectionDAO.QueryCostTimeSeriesDAO queryCostDao =
+        collectionDAO.queryCostRecordTimeSeriesDAO();
+
+    executeOrphanCleanup(
+        "orphan_test_case_resolution_status",
+        () -> resolutionStatusDao.deleteOrphanedRecords(BATCH_SIZE));
+    executeOrphanCleanup(
+        "orphan_agent_execution", () -> agentExecutionDao.deleteOrphanedRecords(BATCH_SIZE));
+    executeOrphanCleanup(
+        "orphan_mcp_execution", () -> mcpExecutionDao.deleteOrphanedRecords(BATCH_SIZE));
+    executeOrphanCleanup(
+        "orphan_profile_data", () -> profilerDao.deleteOrphanedRecords(BATCH_SIZE));
+    executeOrphanCleanup(
+        "orphan_query_cost_time_series", () -> queryCostDao.deleteOrphanedRecords(BATCH_SIZE));
+
+    LOG.info("Orphaned time-series rows cleanup complete.");
+  }
+
+  @Transaction
+  private void cleanTestCaseResults(int retentionPeriod) {
+    LOG.info("Initiating test case results cleanup: Retention = {} days.", retentionPeriod);
+    long cutoffMillis = getRetentionCutoffMillis(retentionPeriod);
+
+    executeWithStatsTracking(
+        "test_case_results",
+        () -> testCaseResultsDAO.deleteRecordsBeforeCutOff(cutoffMillis, BATCH_SIZE));
+
+    LOG.info("Test case results cleanup complete.");
+  }
+
+  @Transaction
+  private void cleanProfileData(int retentionPeriod) {
+    LOG.info("Initiating profile data cleanup: Retention = {} days.", retentionPeriod);
+    long cutoffMillis = getRetentionCutoffMillis(retentionPeriod);
+
+    executeWithStatsTracking(
+        "profile_data", () -> profileDataDAO.deleteRecordsBeforeCutOff(cutoffMillis, BATCH_SIZE));
+
+    LOG.info("Profile data cleanup complete.");
+  }
+
+  @Transaction
+  private void cleanAuditLogs(int retentionPeriod) {
+    LOG.info("Initiating audit logs cleanup: Retention = {} days.", retentionPeriod);
+    long cutoffMillis = getRetentionCutoffMillis(retentionPeriod);
+
+    executeWithStatsTracking(
+        "audit_logs", () -> auditLogDAO.deleteInBatches(cutoffMillis, BATCH_SIZE));
+
+    LOG.info("Audit logs cleanup complete.");
+  }
+
+  private void cleanAutomationWorkflows(int retentionPeriod) {
+    LOG.info("Initiating automation workflows cleanup: Retention = {} days.", retentionPeriod);
+    long cutoffMillis = getRetentionCutoffMillis(retentionPeriod);
+
+    AtomicInteger deletedThisRun = new AtomicInteger();
+    // Ids this run could not delete. Held so a failing row is attempted once instead of again at
+    // the head of every batch - each attempt can be a secrets-manager call - and charged to the
+    // failed count once instead of once per batch. Bounded by MAX_WORKFLOW_DELETES_PER_RUN.
+    Set<String> failedIds = new HashSet<>();
+
+    // Drains on zero progress rather than on a short batch, unlike the bulk-SQL steps. A batch here
+    // can come back full and still delete fewer rows than it fetched, because a workflow that fails
+    // to delete is skipped rather than rethrown. Stopping on a short batch would end the run at the
+    // first such failure, and since batches are ordered oldest first the same undeletable row would
+    // head every batch of every run.
+    drainInBatches(
+        "automation_workflows",
+        () -> deleteExpiredWorkflows(cutoffMillis, deletedThisRun, failedIds),
+        deleted -> deleted == 0);
+
+    if (!failedIds.isEmpty()) {
+      LOG.warn(
+          "Automation workflow cleanup skipped {} workflow(s) it could not delete; the next run "
+              + "retries them.",
+          failedIds.size());
+    }
+    LOG.info("Automation workflows cleanup complete. Deleted {}.", deletedThisRun.get());
+  }
+
+  /**
+   * Deletes one batch through the repository rather than with a bulk SQL delete: a Workflow holds
+   * the service connection it ran against, so dropping the row alone would strand its secrets in an
+   * external secrets manager and leave its owner relationship rows behind.
+   *
+   * <p>A workflow that cannot be deleted is charged to the run's failed count and skipped, not
+   * rethrown. Batches are ordered oldest first, so letting one bad row abort the drain would stop
+   * this cleanup from ever getting past it.
+   *
+   * <p>One such row does not fail the run either. The sibling entity cleanups report per-item
+   * failures through stats alone, and since the same undeletable row heads every batch, flipping
+   * the run's status here would mark every future run FAILED and bury real failures. The run is
+   * escalated only when a batch had rows to attempt and deleted none of them, which means nothing
+   * is getting through rather than one row being bad.
+   *
+   * <p>Deletes non-recursively: a Workflow has no children, and {@code recursive} is what makes
+   * {@code EntityRepository.delete} take a deletion lock, which would be a wasted round-trip per
+   * row.
+   *
+   * @return rows actually deleted, which is what ends the drain. 0 means the batch made no progress
+   *     - every row failed, or the per-run cap is spent - so there is no point asking for the same
+   *     rows again.
+   */
+  private int deleteExpiredWorkflows(
+      long cutoffMillis, AtomicInteger deletedThisRun, Set<String> failedIds) {
+    int budget = MAX_WORKFLOW_DELETES_PER_RUN - deletedThisRun.get();
+    if (budget <= 0) {
+      LOG.info(
+          "Automation workflow cleanup reached its per-run cap of {}; the rest waits for the next run.",
+          MAX_WORKFLOW_DELETES_PER_RUN);
+      return 0;
+    }
+
+    List<String> ids = workflowDAO.listIdsBeforeCutoff(cutoffMillis, Math.min(BATCH_SIZE, budget));
+    int deleted = 0;
+    int attempted = 0;
+    Exception lastFailure = null;
+
+    for (String id : ids) {
+      if (failedIds.contains(id)) {
+        continue;
+      }
+      attempted++;
+      try {
+        Entity.deleteEntity(
+            Entity.ADMIN_USER_NAME, Entity.WORKFLOW, UUID.fromString(id), false, true);
+        deleted++;
+      } catch (Exception ex) {
+        LOG.error("Failed to delete automation workflow {}", id, ex);
+        failedIds.add(id);
+        updateStats("automation_workflows", 0, 1);
+        lastFailure = ex;
+      }
+    }
+
+    if (attempted > 0 && deleted == 0 && lastFailure != null) {
+      internalStatus = AppRunRecord.Status.ACTIVE_ERROR;
+      recordFirstFailure(lastFailure);
+    }
+
+    deletedThisRun.addAndGet(deleted);
+    return deleted;
+  }
+
+  private void executeOrphanCleanup(String entity, Supplier<Integer> deleteFunction) {
+    drainInBatches(entity, deleteFunction, deleted -> deleted == 0);
+  }
+
+  private void executeWithStatsTracking(String entity, Supplier<Integer> deleteFunction) {
+    drainInBatches(entity, deleteFunction, deleted -> deleted < BATCH_SIZE);
+  }
+
+  private void drainInBatches(
+      String entity, Supplier<Integer> deleteFunction, IntPredicate drainedWhen) {
+    BatchDrain.Result result = BatchDrain.drain(deleteFunction, drainedWhen, BATCH_SIZE);
+
+    if (result.failure() != null) {
+      LOG.error("Failed to clean entity: {}", entity, result.failure());
+      internalStatus = AppRunRecord.Status.ACTIVE_ERROR;
+      recordFirstFailure(result.failure());
+    }
+    if (result.hitIterationCap()) {
+      LOG.warn(
+          "Cleanup for {} hit the iteration cap ({}) before draining; "
+              + "remaining rows will be retried on the next DataRetention run.",
+          entity,
+          BatchDrain.MAX_ITERATIONS);
+    }
+
+    updateStats(entity, result.deleted(), result.failed());
+  }
+
+  private long getRetentionCutoffMillis(int retentionPeriodInDays) {
+    return Instant.now()
+        .minusMillis(Duration.ofDays(retentionPeriodInDays).toMillis())
+        .toEpochMilli();
+  }
+
+  static boolean isRetentionEnabled(Integer retentionPeriod) {
+    return retentionPeriod != null && retentionPeriod > 0;
+  }
+
+  private synchronized void updateStats(String entity, int successCount, int failureCount) {
+    StepStats entityStat =
+        retentionStats
+            .getEntityStats()
+            .getAdditionalProperties()
+            .getOrDefault(entity, new StepStats());
+
+    entityStat.setTotalRecords(entityStat.getTotalRecords() + successCount + failureCount);
+    entityStat.setSuccessRecords(entityStat.getSuccessRecords() + successCount);
+    entityStat.setFailedRecords(entityStat.getFailedRecords() + failureCount);
+
+    retentionStats.getEntityStats().withAdditionalProperty(entity, entityStat);
+
+    StepStats jobStats = retentionStats.getJobStats();
+    jobStats.setTotalRecords(jobStats.getTotalRecords() + successCount + failureCount);
+    jobStats.setSuccessRecords(jobStats.getSuccessRecords() + successCount);
+    jobStats.setFailedRecords(jobStats.getFailedRecords() + failureCount);
+  }
+
+  private void recordFirstFailure(Throwable ex) {
+    if (failureDetails == null) {
+      failureDetails = toIndexingError(ex);
+    }
+  }
+
+  private static IndexingError toIndexingError(Throwable ex) {
+    return new IndexingError()
+        .withErrorSource(IndexingError.ErrorSource.JOB)
+        .withMessage(ex.getMessage())
+        .withStackTrace(ExceptionUtils.getStackTrace(ex));
+  }
+
+  private void updateRecordToDbAndNotify(Exception error) {
+    AppRunRecord appRecord = getJobRecord(jobExecutionContext);
+    appRecord.setStatus(internalStatus);
+
+    if (failureDetails != null) {
+      appRecord.setFailureContext(new FailureContext().withFailure(failureDetails));
+    }
+
+    if (WebSocketManager.getInstance() != null) {
+      WebSocketManager.getInstance()
+          .broadCastMessageToAll("data_retention_app_channel", JsonUtils.pojoToJson(appRecord));
+    }
+
+    LOG.info("AppRecord before DB save: {}", JsonUtils.pojoToJson(appRecord));
+    pushAppStatusUpdates(jobExecutionContext, appRecord, true);
+    LOG.info("Final AppRunRecord update: {}", JsonUtils.pojoToJson(appRecord));
+  }
+}

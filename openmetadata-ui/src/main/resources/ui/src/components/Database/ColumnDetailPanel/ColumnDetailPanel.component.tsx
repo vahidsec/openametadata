@@ -1,0 +1,1083 @@
+/*
+ *  Copyright 2025 Collate.
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+import { Button } from '@openmetadata/ui-core-components';
+import {
+  ChevronDown,
+  ChevronRight,
+  ChevronUp,
+  XClose,
+} from '@untitledui/icons';
+import { Card, Drawer, Space, Tooltip, Typography } from 'antd';
+import { AxiosError } from 'axios';
+import classNames from 'classnames';
+import { isString } from 'lodash';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { ReactComponent as IconEdit } from '../../../assets/svg/edit-new.svg';
+import { ReactComponent as ColumnIcon } from '../../../assets/svg/entity/column.svg';
+import { ReactComponent as KeyIcon } from '../../../assets/svg/icon-key.svg';
+import { DE_ACTIVE_COLOR, ENTITY_PATH } from '../../../constants/constants';
+import { OperationPermission } from '../../../context/PermissionProvider/PermissionProvider.interface';
+import { EntityType } from '../../../enums/entity.enum';
+import { Column, TableConstraint } from '../../../generated/entity/data/table';
+import { Type } from '../../../generated/entity/type';
+import { TagLabel, TagSource } from '../../../generated/type/tagLabel';
+import { getTypeByFQN } from '../../../rest/metadataTypeAPI';
+import { getColumnByFQN, updateTableColumn } from '../../../rest/tableAPI';
+import { listTestCases } from '../../../rest/testAPI';
+import { calculateTestCaseStatusCounts } from '../../../utils/DataQuality/DataQualityPureUtils';
+import EntityLink from '../../../utils/EntityLink';
+import { getEntityName } from '../../../utils/EntityNameUtils';
+import { renderHighlightedText } from '../../../utils/EntitySearchUtils';
+import { toEntityData } from '../../../utils/EntitySummaryPanelPureUtils';
+import { getDerivedPermissionFlags } from '../../../utils/PermissionDerivation';
+import {
+  buildColumnBreadcrumbPath,
+  findOriginalColumnIndex,
+  flattenColumns,
+  generateEntityLink,
+  getDataTypeDisplay,
+  mergeTagsWithGlossary,
+  normalizeTags,
+} from '../../../utils/TablePureUtils';
+import { showErrorToast, showSuccessToast } from '../../../utils/ToastUtils';
+import DataQualitySection from '../../common/DataQualitySection/DataQualitySection';
+import { DataQualityTest } from '../../common/DataQualitySection/DataQualitySection.interface';
+import DescriptionSection from '../../common/DescriptionSection/DescriptionSection';
+import GlossaryTermsSection from '../../common/GlossaryTermsSection/GlossaryTermsSection';
+import { EditIconButton } from '../../common/IconButtons/EditIconButton';
+import Loader from '../../common/Loader/Loader';
+import TagsSection from '../../common/TagsSection/TagsSection';
+import { useGenericContext } from '../../Customization/GenericProvider/GenericContext';
+import EntityRightPanelVerticalNav from '../../Entity/EntityRightPanel/EntityRightPanelVerticalNav';
+import { EntityRightPanelTab } from '../../Entity/EntityRightPanel/EntityRightPanelVerticalNav.interface';
+import CustomPropertiesSection from '../../Explore/EntitySummaryPanel/CustomPropertiesSection/CustomPropertiesSection';
+import DataQualityTab from '../../Explore/EntitySummaryPanel/DataQualityTab/DataQualityTab';
+import LineageTabContent from '../../Explore/EntitySummaryPanel/LineageTab/LineageTabContent';
+import { LineageData } from '../../Lineage/Lineage.interface';
+import EntityNameModal from '../../Modals/EntityNameModal/EntityNameModal.component';
+import { EntityName } from '../../Modals/EntityNameModal/EntityNameModal.interface';
+import {
+  ColumnDetailPanelProps,
+  ColumnFieldUpdate,
+  ColumnOrTask,
+  TestCaseStatusCounts,
+} from './ColumnDetailPanel.interface';
+import './ColumnDetailPanel.less';
+import { KeyProfileMetrics } from './KeyProfileMetrics/KeyProfileMetrics.component';
+import { NestedColumnsSection } from './NestedColumnsSection';
+const isColumn = (item: ColumnOrTask | null): item is Column => {
+  return item !== null && 'dataType' in item;
+};
+
+interface ColumnEditPermissionFlags {
+  tags: boolean;
+  glossaryTerms: boolean;
+  description: boolean;
+  viewAllPermission: boolean;
+  customProperties: boolean;
+  displayName: boolean;
+}
+
+function computeHasEditPermission(
+  permissions: OperationPermission,
+  deleted: boolean
+): ColumnEditPermissionFlags {
+  // Each field was a raw `(EditX || EditAll) && !deleted`; the prioritized named flags are a
+  // documented explicit-deny-wins fix (Task 6 Finding 1 / Task 8 Batch 2 precedent): an
+  // explicit `EditX: false` now wins over a bare `EditAll: true`, where the old OR granted
+  // regardless. The flags apply the `deleted` gate themselves.
+  const flags = getDerivedPermissionFlags(permissions, deleted);
+
+  return {
+    tags: flags.canEditTags,
+    glossaryTerms: flags.canEditGlossaryTerms,
+    description: flags.canEditDescription,
+    viewAllPermission: flags.canViewAll,
+    customProperties: flags.canEditCustomFields,
+    displayName: flags.canEditDisplayName,
+  };
+}
+
+export const ColumnDetailPanel = <T extends ColumnOrTask = Column>({
+  column,
+  tableFqn,
+  isOpen,
+  onClose,
+  onColumnFieldUpdate,
+  deleted = false,
+  allColumns = [],
+  onNavigate,
+  tableConstraints = [],
+  entityType,
+}: ColumnDetailPanelProps<T>) => {
+  const { t } = useTranslation();
+  const { permissions, changeSummary } = useGenericContext();
+
+  const previousFqnRef = useRef<string | undefined>();
+  const fetchedColumnFqnRef = useRef<string | undefined>();
+
+  const [isDescriptionLoading, setIsDescriptionLoading] = useState(false);
+  const [isTestCaseLoading, setIsTestCaseLoading] = useState(false);
+  const [isDisplayNameEditing, setIsDisplayNameEditing] = useState(false);
+  const [isColumnDataLoading, setIsColumnDataLoading] = useState(false);
+  const [activeTab, setActiveTab] = useState<EntityRightPanelTab>(
+    EntityRightPanelTab.OVERVIEW
+  );
+  const [statusCounts, setStatusCounts] = useState<TestCaseStatusCounts>({
+    success: 0,
+    failed: 0,
+    aborted: 0,
+    total: 0,
+  });
+  const [lineageData] = useState<LineageData | null>(null);
+  const [isLineageLoading] = useState<boolean>(false);
+  const [entityTypeDetail, setEntityTypeDetail] = useState<Type>();
+  const [activeColumn, setActiveColumn] = useState<Column>(column);
+  const [lineageFilter, setLineageFilter] = useState<'upstream' | 'downstream'>(
+    'downstream'
+  );
+
+  const hasEditPermission = useMemo(
+    () => computeHasEditPermission(permissions, deleted),
+    [permissions, deleted]
+  );
+
+  // The view-tier flags are consumed directly further down (custom properties and the data
+  // quality tab); `computeHasEditPermission` only returns the edit-tier object.
+  const { canViewCustomFields, canViewTests } = useMemo(
+    () => getDerivedPermissionFlags(permissions, deleted),
+    [permissions, deleted]
+  );
+
+  const flattenedColumns = useMemo(
+    () => flattenColumns(allColumns as Column[]),
+    [allColumns]
+  );
+
+  const { actualColumnIndex, isColumnInList } = useMemo(() => {
+    if (!activeColumn?.fullyQualifiedName) {
+      return {
+        actualColumnIndex: 0,
+        isColumnInList: flattenedColumns.length > 0,
+      };
+    }
+
+    const index = flattenedColumns.findIndex(
+      (col) => col.fullyQualifiedName === activeColumn.fullyQualifiedName
+    );
+
+    return {
+      actualColumnIndex: index === -1 ? 0 : index,
+      isColumnInList: index !== -1,
+    };
+  }, [activeColumn, flattenedColumns]);
+
+  const breadcrumbPath = useMemo(() => {
+    if (!isColumn(activeColumn)) {
+      return [];
+    }
+
+    return buildColumnBreadcrumbPath(activeColumn, allColumns as Column[]);
+  }, [activeColumn, allColumns]);
+
+  const nestedColumns = useMemo(() => {
+    if (!isColumn(activeColumn)) {
+      return [];
+    }
+
+    return activeColumn.children || [];
+  }, [activeColumn]);
+
+  const dataQualityTests = useMemo(
+    (): DataQualityTest[] => [
+      { type: 'success', count: statusCounts.success },
+      { type: 'aborted', count: statusCounts.aborted },
+      { type: 'failed', count: statusCounts.failed },
+    ],
+    [statusCounts]
+  );
+
+  const classificationTags = useMemo(
+    () =>
+      activeColumn?.tags?.filter((tag) => tag.source !== TagSource.Glossary) ||
+      [],
+    [activeColumn?.tags]
+  );
+
+  const isPrimaryKey = useMemo(() => {
+    const columnName = activeColumn?.name;
+    if (!columnName) {
+      return false;
+    }
+
+    return tableConstraints.some(
+      (constraint: TableConstraint) =>
+        constraint.constraintType === 'PRIMARY_KEY' &&
+        constraint.columns?.includes(columnName)
+    );
+  }, [activeColumn?.name, tableConstraints]);
+
+  const isPreviousDisabled = !isColumnInList || actualColumnIndex === 0;
+  const isNextDisabled =
+    !isColumnInList || actualColumnIndex === flattenedColumns.length - 1;
+
+  const fetchTestCases = useCallback(async () => {
+    if (!column?.fullyQualifiedName) {
+      setIsTestCaseLoading(false);
+
+      return;
+    }
+
+    try {
+      setIsTestCaseLoading(true);
+      const entityLink = generateEntityLink(column.fullyQualifiedName);
+
+      const response = await listTestCases({
+        entityLink,
+        includeAllTests: true,
+        limit: 100,
+        fields: ['testCaseResult', 'incidentId'],
+      });
+
+      const counts = calculateTestCaseStatusCounts(response.data || []);
+      setStatusCounts(counts);
+    } catch (error) {
+      showErrorToast(error as AxiosError);
+      setStatusCounts({ success: 0, failed: 0, aborted: 0, total: 0 });
+    } finally {
+      setIsTestCaseLoading(false);
+    }
+  }, [column?.fullyQualifiedName]);
+
+  const fetchColumnDetails = useCallback(async () => {
+    const targetFqn = column?.fullyQualifiedName;
+    if (!targetFqn || !isOpen || !tableFqn) {
+      return;
+    }
+
+    if (
+      entityType === EntityType.TABLE &&
+      fetchedColumnFqnRef.current !== targetFqn
+    ) {
+      try {
+        setIsColumnDataLoading(true);
+        const latestColumn = await getColumnByFQN(targetFqn, {
+          entityType,
+          fields: 'tags,customMetrics,extension,profile',
+        });
+
+        setActiveColumn((prev) => {
+          if (prev?.fullyQualifiedName !== targetFqn) {
+            return prev;
+          }
+
+          return { ...prev, ...latestColumn } as Column;
+        });
+
+        fetchedColumnFqnRef.current = targetFqn;
+      } catch (error) {
+        showErrorToast(error as AxiosError);
+      } finally {
+        setIsColumnDataLoading(false);
+      }
+    }
+  }, [column?.fullyQualifiedName, isOpen, entityType, tableFqn]);
+
+  const handleNestedColumnClick = useCallback(
+    (nestedColumn: Column) => {
+      if (!onNavigate) {
+        return;
+      }
+
+      const targetIndex = flattenedColumns.findIndex(
+        (col) => col.fullyQualifiedName === nestedColumn.fullyQualifiedName
+      );
+
+      const originalIndex = findOriginalColumnIndex(
+        nestedColumn as T,
+        allColumns ?? []
+      );
+
+      onNavigate(
+        nestedColumn as T,
+        originalIndex >= 0 ? originalIndex : targetIndex
+      );
+    },
+    [flattenedColumns, allColumns, onNavigate]
+  );
+
+  const handleBreadcrumbClick = useCallback(
+    (breadcrumbColumn: Column) => {
+      if (!onNavigate) {
+        return;
+      }
+
+      const targetIndex = flattenedColumns.findIndex(
+        (col) => col.fullyQualifiedName === breadcrumbColumn.fullyQualifiedName
+      );
+
+      const originalIndex = findOriginalColumnIndex(
+        breadcrumbColumn as T,
+        allColumns ?? []
+      );
+
+      onNavigate(
+        breadcrumbColumn as T,
+        originalIndex >= 0 ? originalIndex : targetIndex
+      );
+    },
+    [flattenedColumns, allColumns, onNavigate]
+  );
+
+  const performColumnFieldUpdate = useCallback(
+    async (
+      update: ColumnFieldUpdate,
+      successMessageKey: string
+    ): Promise<T | undefined> => {
+      if (!activeColumn?.fullyQualifiedName) {
+        return undefined;
+      }
+
+      const response = onColumnFieldUpdate
+        ? await onColumnFieldUpdate(
+            activeColumn.fullyQualifiedName,
+            update,
+            true
+          )
+        : // Fallback to direct API call for Table entities when used outside GenericProvider
+          ((await updateTableColumn(
+            activeColumn.fullyQualifiedName,
+            update
+          )) as T);
+
+      if (response) {
+        showSuccessToast(
+          t('server.update-entity-success', {
+            entity: t(successMessageKey),
+          })
+        );
+      }
+
+      return response;
+    },
+    [activeColumn?.fullyQualifiedName, t, onColumnFieldUpdate]
+  );
+
+  const handleDescriptionUpdate = useCallback(
+    async (newDescription: string) => {
+      try {
+        setIsDescriptionLoading(true);
+        await performColumnFieldUpdate(
+          { description: newDescription },
+          'label.description'
+        );
+      } catch (error) {
+        showErrorToast(
+          error as AxiosError,
+          t('server.entity-updating-error', {
+            entity: t('label.description'),
+          })
+        );
+      } finally {
+        setIsDescriptionLoading(false);
+      }
+    },
+    [performColumnFieldUpdate, t]
+  );
+
+  // Preserve glossary and tier tags when updating classification tags
+  const prepareClassificationTags = useCallback(
+    (updatedTags: TagLabel[]): TagLabel[] => {
+      if (updatedTags.length === 0) {
+        return normalizeTags(
+          (activeColumn?.tags ?? []).filter(
+            (tag) =>
+              tag.source === TagSource.Glossary ||
+              (tag.tagFQN?.startsWith('Tier.') ?? false)
+          )
+        );
+      }
+
+      return normalizeTags(
+        (mergeTagsWithGlossary(activeColumn?.tags, updatedTags) ??
+          []) as TagLabel[]
+      );
+    },
+    [activeColumn?.tags]
+  );
+
+  const handleTagsUpdate = useCallback(
+    async (updatedTags: TagLabel[]) => {
+      try {
+        const allTags = prepareClassificationTags(updatedTags);
+        const response = await performColumnFieldUpdate(
+          { tags: allTags },
+          'label.tag-plural'
+        );
+
+        if (response) {
+          setActiveColumn((prev: Column) => ({
+            ...prev,
+            tags: response.tags,
+          }));
+        }
+
+        return response?.tags;
+      } catch (error) {
+        showErrorToast(
+          error as AxiosError,
+          t('server.entity-updating-error', {
+            entity: t('label.tag-plural'),
+          })
+        );
+
+        throw error;
+      }
+    },
+    [prepareClassificationTags, performColumnFieldUpdate, t]
+  );
+
+  const handleGlossaryTermsUpdate = useCallback(
+    async (updatedTags: TagLabel[]) => {
+      try {
+        // Merge glossary terms with existing classification tags
+        const classificationAndTierTags = (activeColumn?.tags ?? []).filter(
+          (tag) =>
+            tag.source === TagSource.Classification ||
+            (tag.tagFQN?.startsWith('Tier.') ?? false)
+        );
+        const allTags = normalizeTags([
+          ...classificationAndTierTags,
+          ...updatedTags.filter((tag) => tag.source === TagSource.Glossary),
+        ]);
+
+        const response = await performColumnFieldUpdate(
+          { tags: allTags },
+          'label.glossary-term-plural'
+        );
+
+        if (response) {
+          setActiveColumn((prev: Column) => ({
+            ...prev,
+            tags: response.tags,
+          }));
+        }
+
+        return response?.tags;
+      } catch (error) {
+        showErrorToast(
+          error as AxiosError,
+          t('server.entity-updating-error', {
+            entity: t('label.glossary-term-plural'),
+          })
+        );
+
+        throw error;
+      }
+    },
+    [activeColumn?.tags, performColumnFieldUpdate, t]
+  );
+
+  const handleExtensionUpdate = useCallback(
+    async (updatedExtension: Record<string, unknown> | undefined) => {
+      try {
+        await performColumnFieldUpdate(
+          { extension: updatedExtension },
+          'label.custom-property-plural'
+        );
+      } catch (error) {
+        showErrorToast(
+          error as AxiosError,
+          t('server.entity-updating-error', {
+            entity: t('label.custom-property-plural'),
+          })
+        );
+      }
+    },
+    [performColumnFieldUpdate, t]
+  );
+
+  const handleDisplayNameUpdate = useCallback(
+    async (data: EntityName) => {
+      try {
+        const response = await performColumnFieldUpdate(
+          { displayName: data.displayName },
+          'label.display-name'
+        );
+        if (response) {
+          setActiveColumn((prev: Column) => ({
+            ...prev,
+            displayName: (response as { displayName?: string }).displayName,
+          }));
+        }
+      } catch (error) {
+        showErrorToast(
+          error as AxiosError,
+          t('server.entity-updating-error', {
+            entity: t('label.display-name'),
+          })
+        );
+      } finally {
+        setIsDisplayNameEditing(false);
+      }
+    },
+    [performColumnFieldUpdate, t]
+  );
+
+  const handleColumnNavigation = useCallback(
+    (direction: 'previous' | 'next') => {
+      if (!onNavigate) {
+        return;
+      }
+
+      const isPrevious = direction === 'previous';
+      const canNavigate = isPrevious
+        ? actualColumnIndex > 0
+        : actualColumnIndex < flattenedColumns.length - 1;
+
+      if (!canNavigate) {
+        return;
+      }
+
+      const targetIndex = isPrevious
+        ? actualColumnIndex - 1
+        : actualColumnIndex + 1;
+      const targetColumn = flattenedColumns[targetIndex];
+      const originalIndex = findOriginalColumnIndex(
+        targetColumn as T,
+        allColumns ?? []
+      );
+
+      onNavigate(
+        targetColumn as T,
+        originalIndex >= 0 ? originalIndex : targetIndex
+      );
+    },
+    [actualColumnIndex, flattenedColumns, allColumns, onNavigate]
+  );
+
+  const handlePreviousColumn = useCallback(
+    () => handleColumnNavigation('previous'),
+    [handleColumnNavigation]
+  );
+
+  const handleNextColumn = useCallback(
+    () => handleColumnNavigation('next'),
+    [handleColumnNavigation]
+  );
+
+  useEffect(() => {
+    const fetchEntityTypeDetail = async () => {
+      try {
+        const res = await getTypeByFQN(ENTITY_PATH.column);
+        setEntityTypeDetail(res);
+      } catch (error) {
+        showErrorToast(error as AxiosError);
+      }
+    };
+
+    if (canViewCustomFields) {
+      fetchEntityTypeDetail();
+    }
+  }, [canViewCustomFields]);
+
+  useEffect(() => {
+    setActiveColumn(column);
+  }, [column]);
+
+  useEffect(() => {
+    fetchColumnDetails();
+  }, [fetchColumnDetails]);
+
+  useEffect(() => {
+    if (isOpen && entityType === EntityType.TABLE && canViewTests) {
+      fetchTestCases();
+    }
+  }, [isOpen, fetchTestCases, entityType, canViewTests]);
+
+  useEffect(() => {
+    if (isOpen && activeColumn) {
+      if (activeColumn.fullyQualifiedName !== previousFqnRef.current) {
+        if (previousFqnRef.current === undefined) {
+          setActiveTab(EntityRightPanelTab.OVERVIEW);
+        }
+        previousFqnRef.current = activeColumn.fullyQualifiedName;
+      }
+    } else if (!isOpen) {
+      previousFqnRef.current = undefined;
+      fetchedColumnFqnRef.current = undefined;
+    }
+  }, [isOpen, activeColumn?.fullyQualifiedName]);
+
+  const handleTabChange = (tab: EntityRightPanelTab) => {
+    setActiveTab(tab);
+  };
+
+  const renderDescriptionBlock = () => {
+    if (isDescriptionLoading) {
+      return (
+        <div className="tw:flex tw:items-center tw:justify-center tw:p-6">
+          <Loader size="small" />
+        </div>
+      );
+    }
+
+    return (
+      <DescriptionSection
+        changeSummaryEntry={
+          changeSummary?.[
+            `columns.${EntityLink.getTableColumnNameFromColumnFqn(
+              activeColumn?.fullyQualifiedName ?? '',
+              false
+            )}.description`
+          ]
+        }
+        description={activeColumn?.description}
+        entityFqn={activeColumn?.fullyQualifiedName}
+        entityType={entityType}
+        hasPermission={hasEditPermission?.description ?? false}
+        onDescriptionUpdate={handleDescriptionUpdate}
+      />
+    );
+  };
+
+  const renderKeyProfileMetrics = () =>
+    isColumn(activeColumn ?? null) && entityType === EntityType.TABLE ? (
+      <KeyProfileMetrics profile={activeColumn.profile} />
+    ) : null;
+
+  const renderNestedColumnsBlock = () =>
+    isColumn(activeColumn ?? null) ? (
+      <NestedColumnsSection
+        columns={nestedColumns}
+        entityType={entityType}
+        onColumnClick={handleNestedColumnClick}
+      />
+    ) : null;
+
+  const renderDataQualityBlock = () => {
+    if (statusCounts.total <= 0) {
+      return null;
+    }
+
+    return isTestCaseLoading ? (
+      <Loader size="small" />
+    ) : (
+      <DataQualitySection
+        tests={dataQualityTests}
+        totalTests={statusCounts.total}
+      />
+    );
+  };
+
+  const renderOverviewTab = () => {
+    if (isColumnDataLoading) {
+      return (
+        <div className="tw:flex tw:items-center tw:justify-center tw:p-6">
+          <Loader size="default" />
+        </div>
+      );
+    }
+
+    return (
+      <Space className="tw:w-full" direction="vertical" size="large">
+        {renderDescriptionBlock()}
+
+        {renderKeyProfileMetrics()}
+
+        {renderNestedColumnsBlock()}
+
+        {renderDataQualityBlock()}
+
+        <GlossaryTermsSection
+          entityId={activeColumn?.fullyQualifiedName || ''}
+          entityType={'_column' as EntityType}
+          hasPermission={hasEditPermission?.glossaryTerms ?? false}
+          maxVisibleGlossaryTerms={3}
+          tags={activeColumn?.tags}
+          onGlossaryTermsUpdate={handleGlossaryTermsUpdate}
+        />
+
+        <TagsSection
+          entityId={activeColumn?.fullyQualifiedName || ''}
+          entityType={'_column' as EntityType}
+          hasPermission={hasEditPermission?.tags ?? false}
+          tags={classificationTags}
+          onTagsUpdate={handleTagsUpdate}
+        />
+      </Space>
+    );
+  };
+
+  const renderLineageTab = () => {
+    if (isLineageLoading) {
+      return (
+        <div className="tw:flex tw:items-center tw:justify-center tw:p-6">
+          <Loader size="default" />
+        </div>
+      );
+    }
+
+    if (!lineageData) {
+      return (
+        <div className="tw:text-center tw:text-gray-400 tw:p-6">
+          {t('label.no-data-found')}
+        </div>
+      );
+    }
+
+    return (
+      <LineageTabContent
+        entityFqn={activeColumn?.fullyQualifiedName || ''}
+        filter={lineageFilter}
+        lineageData={lineageData}
+        onFilterChange={setLineageFilter}
+      />
+    );
+  };
+
+  const renderCustomPropertiesTab = () => {
+    if (!activeColumn?.fullyQualifiedName) {
+      return null;
+    }
+
+    return (
+      <div className="tw:h-auto">
+        <CustomPropertiesSection
+          emptyStateMessage={t('label.table-entity-text', {
+            entityText: t('label.column-plural'),
+          })}
+          entityData={toEntityData(activeColumn)}
+          entityType={entityType}
+          entityTypeDetail={entityTypeDetail}
+          hasEditPermissions={hasEditPermission.customProperties}
+          isEntityDataLoading={false}
+          viewCustomPropertiesPermission={canViewCustomFields}
+          onExtensionUpdate={handleExtensionUpdate}
+        />
+      </div>
+    );
+  };
+
+  const isTableOrDashboardDataModel =
+    entityType === EntityType.TABLE ||
+    entityType === EntityType.DASHBOARD_DATA_MODEL;
+
+  function renderBreadcrumbs() {
+    if (breadcrumbPath.length <= 1) {
+      return null;
+    }
+
+    return breadcrumbPath.map((breadcrumb, index) => {
+      const isLastItem = index === breadcrumbPath.length - 1;
+
+      return (
+        <div
+          className="tw:inline-flex tw:items-center tw:min-w-0"
+          key={breadcrumb.fullyQualifiedName}>
+          <div className="tw:inline-flex tw:items-center tw:gap-0.5 tw:min-w-0">
+            <Typography.Text
+              className={classNames('tw:text-xs tw:truncate', {
+                'tw:max-w-48 tw:cursor-default tw:font-medium tw:text-secondary':
+                  isLastItem,
+                'tw:max-w-32 tw:cursor-pointer tw:font-normal tw:text-gray-400 hover:tw:underline':
+                  !isLastItem,
+              })}
+              title={getEntityName(breadcrumb)}
+              onClick={
+                isLastItem ? undefined : () => handleBreadcrumbClick(breadcrumb)
+              }>
+              {getEntityName(breadcrumb)}
+            </Typography.Text>
+            {index < breadcrumbPath.length - 1 && (
+              <ChevronRight
+                className="tw:text-gray-400 tw:shrink-0"
+                height={16}
+                width={16}
+              />
+            )}
+          </div>
+        </div>
+      );
+    });
+  }
+
+  function renderEditDisplayNameButton() {
+    if (!hasEditPermission.displayName) {
+      return null;
+    }
+    if (
+      entityType !== EntityType.TABLE &&
+      entityType !== EntityType.DASHBOARD_DATA_MODEL
+    ) {
+      return null;
+    }
+
+    return (
+      <EditIconButton
+        newLook
+        className="tw:ml-2"
+        data-testid="edit-displayName-button"
+        disabled={false}
+        icon={<IconEdit color={DE_ACTIVE_COLOR} height={18} width={18} />}
+        size="small"
+        title={t('label.edit-entity', {
+          entity: t('label.display-name'),
+        })}
+        onClick={() => setIsDisplayNameEditing(true)}
+      />
+    );
+  }
+
+  function renderDisplayNameSubtitle() {
+    if (!activeColumn.displayName) {
+      return null;
+    }
+    if (activeColumn.displayName === activeColumn.name) {
+      return null;
+    }
+    if (!isTableOrDashboardDataModel) {
+      return null;
+    }
+
+    return (
+      <Typography.Text
+        className="tw:text-gray-400 tw:text-xs"
+        data-testid="entity-name"
+        ellipsis={{ tooltip: true }}>
+        {renderHighlightedText(activeColumn.name || '')}
+      </Typography.Text>
+    );
+  }
+
+  function renderDataTypeChip() {
+    if (!isColumn(activeColumn) || !getDataTypeDisplay(activeColumn)) {
+      return null;
+    }
+
+    return (
+      <Tooltip
+        placement="bottom"
+        title={getDataTypeDisplay(activeColumn)}
+        trigger="hover">
+        <div
+          className="tw:max-w-60 tw:flex tw:items-center tw:justify-center tw:overflow-hidden
+                  tw:text-ellipsis data-type-chip
+                  ">
+          {getDataTypeDisplay(activeColumn) || ''}
+        </div>
+      </Tooltip>
+    );
+  }
+
+  function renderPrimaryKeyChip() {
+    if (!isColumn(activeColumn) || !isPrimaryKey) {
+      return null;
+    }
+
+    return (
+      <div className="data-type-chip tw:flex tw:items-center tw:gap-1">
+        <KeyIcon height={12} width={12} />
+        {t('label.primary-key')}
+      </div>
+    );
+  }
+
+  function renderColumnTitle() {
+    if (!activeColumn) {
+      return null;
+    }
+
+    return (
+      <div className="title-section">
+        <div className="tw:ml-4 tw:flex tw:flex-wrap tw:items-center tw:overflow-hidden">
+          {renderBreadcrumbs()}
+        </div>
+        <div className="title-container tw:items-start tw:gap-4">
+          <div className="tw:flex tw:items-center tw:justify-between tw:w-full tw:min-w-0 tw:overflow-hidden">
+            <div
+              className="tw:flex tw:items-center tw:min-w-0 tw:overflow-hidden tw:pr-4"
+              style={{ flex: 1 }}>
+              <div className="tw:mr-2 tw:flex tw:shrink-0 tw:h-10 tw:w-10 tw:items-center tw:justify-center tw:rounded tw:shadow-sm">
+                <ColumnIcon className="tw:h-5 tw:w-5 tw:text-secondary" />
+              </div>
+              <div className="tw:flex tw:flex-col tw:min-w-0 tw:overflow-hidden">
+                <div className="tw:flex tw:items-center tw:gap-2 tw:min-w-0 tw:overflow-hidden">
+                  <Tooltip
+                    mouseEnterDelay={0.5}
+                    placement="topLeft"
+                    title={getEntityName(activeColumn)}
+                    trigger="hover">
+                    <Typography.Text
+                      ellipsis
+                      className="entity-title-link"
+                      data-testid="entity-link">
+                      {renderHighlightedText(
+                        (activeColumn as { displayName?: string })
+                          .displayName ||
+                          activeColumn.name ||
+                          ''
+                      )}
+                    </Typography.Text>
+                  </Tooltip>
+
+                  {renderEditDisplayNameButton()}
+                </div>
+                {renderDisplayNameSubtitle()}
+              </div>
+            </div>
+            <div className="tw:shrink-0">
+              <Button
+                color="secondary"
+                data-testid="close-button"
+                iconLeading={XClose}
+                size="sm"
+                onClick={onClose}
+              />
+            </div>
+          </div>
+          <div className="tw:flex tw:items-center tw:gap-2">
+            {renderDataTypeChip()}
+            {renderPrimaryKeyChip()}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const columnTitle = renderColumnTitle();
+
+  const renderTabContent = () => {
+    if (!activeColumn) {
+      return null;
+    }
+
+    switch (activeTab) {
+      case EntityRightPanelTab.DATA_QUALITY:
+        return (
+          <DataQualityTab
+            isColumnDetailPanel
+            entityFQN={activeColumn.fullyQualifiedName || ''}
+            hasViewTests={canViewTests}
+          />
+        );
+      case EntityRightPanelTab.LINEAGE:
+        return <div className="tw:h-auto">{renderLineageTab()}</div>;
+      case EntityRightPanelTab.CUSTOM_PROPERTIES:
+        return <div className="tw:h-auto">{renderCustomPropertiesTab()}</div>;
+      case EntityRightPanelTab.RELATIONS:
+        return null;
+      case EntityRightPanelTab.OVERVIEW:
+      default:
+        return <div className="tw:h-auto">{renderOverviewTab()}</div>;
+    }
+  };
+
+  if (!activeColumn) {
+    return null;
+  }
+
+  function renderColumnCountLabel() {
+    if (!isColumnInList || flattenedColumns.length <= 0) {
+      return null;
+    }
+
+    return (
+      <Typography.Text className="pagination-header-text tw:font-medium">
+        {actualColumnIndex + 1} {t('label.of-lowercase')}{' '}
+        {flattenedColumns.length} {t('label.column-plural').toLowerCase()}
+      </Typography.Text>
+    );
+  }
+
+  function renderDisplayNameModal() {
+    if (!isDisplayNameEditing || !activeColumn) {
+      return null;
+    }
+
+    const displayName = (activeColumn as { displayName?: string }).displayName;
+
+    return (
+      <EntityNameModal
+        entity={{
+          name: isString(activeColumn.name) ? activeColumn.name : '',
+          displayName: isString(displayName) ? displayName : undefined,
+        }}
+        title={t('label.edit-entity', {
+          entity: t('label.display-name'),
+        })}
+        visible={isDisplayNameEditing}
+        onCancel={() => setIsDisplayNameEditing(false)}
+        onSave={handleDisplayNameUpdate}
+      />
+    );
+  }
+
+  const navFooter = (
+    <div className="tw:flex tw:justify-between tw:items-center tw:w-full navigation-container">
+      <div className="tw:flex tw:items-center tw:gap-1 tw:mt-2">
+        <Button
+          color="secondary"
+          iconLeading={ChevronUp}
+          isDisabled={isPreviousDisabled}
+          size="sm"
+          onClick={handlePreviousColumn}
+        />
+        <Button
+          color="secondary"
+          iconLeading={ChevronDown}
+          isDisabled={isNextDisabled}
+          size="sm"
+          onClick={handleNextColumn}
+        />
+        {renderColumnCountLabel()}
+      </div>
+    </div>
+  );
+
+  return (
+    <Drawer
+      className="column-detail-panel"
+      closable={false}
+      footer={navFooter}
+      open={isOpen}
+      placement="right"
+      title={columnTitle}
+      width="40%"
+      onClose={onClose}>
+      <div className="column-detail-panel-container">
+        <div className="tw:flex tw:gap-2 tw:h-full">
+          <Card bordered={false} className="summary-panel-container">
+            <Card
+              className="tw:h-full tw:overflow-y-auto tw:max-h-full"
+              style={{ width: '100%' }}>
+              {renderTabContent()}
+            </Card>
+          </Card>
+          <div className="tw:mr-2">
+            <EntityRightPanelVerticalNav
+              isColumnDetailPanel
+              activeTab={activeTab}
+              entityType={entityType}
+              verticalNavConatinerclassName="tw:w-[70px]"
+              onTabChange={handleTabChange}
+            />
+          </div>
+        </div>
+      </div>
+      {renderDisplayNameModal()}
+    </Drawer>
+  );
+};

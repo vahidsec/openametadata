@@ -1,0 +1,589 @@
+/*
+ *  Copyright 2023 Collate.
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+import { Box } from '@openmetadata/ui-core-components';
+import { DefaultOptionType } from 'antd/lib/select';
+import { isArray, isEmpty, isEqual } from 'lodash';
+import { lazy, ReactNode, useCallback, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router-dom';
+import {
+  WidgetCommentButton,
+  WidgetEditButton,
+  WidgetPlusButton,
+  WidgetRequestButton,
+} from '../../../components/common/WidgetActionButton/WidgetActionButton';
+import { LIST_SIZE } from '../../../constants/constants';
+import { EntityType } from '../../../enums/entity.enum';
+import { LabelType } from '../../../generated/entity/data/table';
+import { State, TagLabel, TagSource } from '../../../generated/type/tagLabel';
+import EntityLink from '../../../utils/EntityLink';
+import { getEntityFeedLink } from '../../../utils/EntityPureUtils';
+import { stopPropagationIfInteractive } from '../../../utils/InteractiveTargetUtils';
+import { getTierTags } from '../../../utils/TablePureUtils';
+import { getFilterTags } from '../../../utils/TableTags/TableTags.utils';
+import tagClassBase from '../../../utils/TagClassBase';
+import { getTagPlaceholder } from '../../../utils/TagsPureUtils';
+import { fetchGlossaryList } from '../../../utils/TagsUtils';
+import {
+  getRequestTagsPath,
+  getUpdateTagsPath,
+} from '../../../utils/TaskNavigationUtils';
+import withSuspenseFallback from '../../AppRouter/withSuspenseFallback';
+import { SelectOption } from '../../common/AsyncSelectList/AsyncSelectList.interface';
+import GlossaryTermPicker from '../../common/GlossaryTermPicker/GlossaryTermPicker';
+import { EditIconButton } from '../../common/IconButtons/EditIconButton';
+import WidgetCard from '../../common/WidgetCard/WidgetCard';
+import { useGenericContext } from '../../Customization/GenericProvider/GenericContext';
+import SuggestionsAlert from '../../Suggestions/SuggestionsAlert/SuggestionsAlert';
+import { useSuggestionsContext } from '../../Suggestions/SuggestionsProvider/SuggestionsProvider';
+import TagsViewer from '../TagsViewer/TagsViewer';
+import { LayoutType } from '../TagsViewer/TagsViewer.interface';
+import './tags-container.style.less';
+import { TagsContainerV2Props } from './TagsContainerV2.interface';
+const TagSelectForm = withSuspenseFallback(
+  lazy(() => import('../TagsSelectForm/TagsSelectForm.component'))
+);
+
+const TagsContainerV2 = ({
+  permission,
+  showTaskHandler = true,
+  selectedTags,
+  entityType,
+  entityFqn,
+  tagType,
+  displayType,
+  layoutType,
+  showBottomEditButton,
+  showInlineEditButton,
+  columnData,
+  onSelectionChange,
+  children,
+  defaultLabelType,
+  defaultState,
+  newLook = false,
+  sizeCap = LIST_SIZE,
+  useGenericControls,
+  multiSelect,
+}: TagsContainerV2Props) => {
+  const navigate = useNavigate();
+  const { t } = useTranslation();
+  const {
+    onThreadLinkSelect,
+    activeTagDropdownKey,
+    updateActiveTagDropdownKey,
+  } = useGenericContext();
+  const { selectedUserSuggestions } = useSuggestionsContext();
+  const tags = useMemo(() => getFilterTags(selectedTags), [selectedTags]);
+  const [internalIsEditTags, setInternalIsEditTags] = useState(false);
+
+  const { isEditTags, dropdownKey } = useMemo(() => {
+    const columnDifferentiator = columnData?.fqn || columnData?.name;
+    const dropdownKey = `${columnDifferentiator ?? entityFqn}-${tagType}`;
+
+    return {
+      dropdownKey,
+      isEditTags: useGenericControls
+        ? activeTagDropdownKey === dropdownKey
+        : internalIsEditTags,
+    };
+  }, [
+    tagType,
+    entityFqn,
+    columnData?.fqn,
+    activeTagDropdownKey,
+    updateActiveTagDropdownKey,
+    internalIsEditTags,
+    useGenericControls,
+  ]);
+
+  const handleExternalControl = useCallback(
+    (isOpen: boolean) => {
+      if (!useGenericControls) {
+        setInternalIsEditTags(isOpen);
+
+        return;
+      }
+      if (isOpen) {
+        updateActiveTagDropdownKey(dropdownKey);
+
+        return;
+      }
+      // Clear only while the key is ours, so a sibling's open is not cancelled.
+      if (isEditTags) {
+        updateActiveTagDropdownKey(null);
+      }
+    },
+    [useGenericControls, dropdownKey, isEditTags]
+  );
+
+  const {
+    isGlossaryType,
+    showAddTagButton,
+    selectedTagsInternal,
+    isHoriZontalLayout,
+    initialOptions,
+  } = useMemo(
+    () => ({
+      isGlossaryType: tagType === TagSource.Glossary,
+      showAddTagButton: permission && isEmpty(tags?.[tagType]),
+      selectedTagsInternal: tags?.[tagType]?.map(({ tagFQN }) => tagFQN),
+      initialOptions: tags?.[tagType]?.map((data) => ({
+        label: data.tagFQN,
+        value: data.tagFQN,
+        data,
+      })) as SelectOption[],
+      isHoriZontalLayout: layoutType === LayoutType.HORIZONTAL,
+    }),
+    [tagType, permission, tags?.[tagType], tags, layoutType]
+  );
+
+  const fetchAPI = useCallback(
+    (searchValue: string, page: number) => {
+      if (tagType === TagSource.Classification) {
+        return tagClassBase.getTags(searchValue, page);
+      } else {
+        return fetchGlossaryList(searchValue, page);
+      }
+    },
+    [tagType]
+  );
+
+  const showNoDataPlaceholder = useMemo(
+    () => !showAddTagButton && isEmpty(tags?.[tagType]),
+    [showAddTagButton, tags?.[tagType]]
+  );
+
+  const handleSave = async (data: DefaultOptionType | DefaultOptionType[]) => {
+    // Pass every TagLabel field through so server-managed ones (appliedBy, appliedAt) survive the JSON-Patch diff.
+    const updatedTags = (isArray(data) ? data : [data]).map((tag) => {
+      const tagFQN: string =
+        typeof tag === 'string' ? tag : String(tag.value ?? '');
+
+      const option = typeof tag === 'object' ? tag.data ?? {} : {};
+
+      return {
+        tagFQN,
+        source: tagType,
+        labelType: option.labelType ?? defaultLabelType ?? LabelType.Manual,
+        state: option.state ?? defaultState ?? State.Confirmed,
+        name: option.name,
+        displayName: option.displayName,
+        description: option.description,
+        style: option.style,
+        href: option.href,
+        appliedBy: option.appliedBy,
+        appliedAt: option.appliedAt,
+        metadata: option.metadata,
+        reason: option.reason,
+      };
+    });
+
+    const newTags = updatedTags.map((t) => t.tagFQN);
+
+    if (onSelectionChange && !isEqual(selectedTagsInternal, newTags)) {
+      await onSelectionChange([
+        ...updatedTags,
+        ...((isGlossaryType
+          ? tags?.[TagSource.Classification]
+          : tags?.[TagSource.Glossary]) ?? []),
+      ]);
+    }
+
+    handleExternalControl(false);
+  };
+
+  const handleCancel = useCallback(() => {
+    handleExternalControl(false);
+  }, [handleExternalControl]);
+
+  const handleAddClick = useCallback(() => {
+    handleExternalControl(true);
+  }, [handleExternalControl]);
+
+  const handleGlossaryTermsChange = useCallback(
+    async (terms: TagLabel[]) => {
+      const updatedTags = terms.map((term) => ({
+        ...term,
+        source: TagSource.Glossary,
+        labelType: term.labelType ?? defaultLabelType ?? LabelType.Manual,
+        state: term.state ?? defaultState ?? State.Confirmed,
+      }));
+
+      if (
+        onSelectionChange &&
+        !isEqual(
+          selectedTagsInternal,
+          updatedTags.map(({ tagFQN }) => tagFQN)
+        )
+      ) {
+        await onSelectionChange([
+          ...updatedTags,
+          ...(tags?.[TagSource.Classification] ?? []),
+        ]);
+      }
+
+      handleExternalControl(false);
+    },
+    [
+      onSelectionChange,
+      selectedTagsInternal,
+      tags,
+      defaultLabelType,
+      defaultState,
+      handleExternalControl,
+    ]
+  );
+
+  // One anchor per layout, so two popovers can never open at once.
+  const glossaryAnchorSlot = newLook ? 'header' : 'body';
+
+  // Glossary picks happen in a popover; classification still swaps the body.
+  const withGlossaryPopover = useCallback(
+    (trigger: ReactNode, slot: 'header' | 'body') =>
+      isGlossaryType && trigger && slot === glossaryAnchorSlot ? (
+        <GlossaryTermPicker
+          commitMode="staged"
+          data-testid="glossary-term-picker"
+          isOpen={isEditTags}
+          multiple={multiSelect}
+          renderTrigger={() => trigger}
+          value={tags?.[TagSource.Glossary] ?? []}
+          onChange={handleGlossaryTermsChange}
+          onOpenChange={handleExternalControl}
+        />
+      ) : (
+        trigger
+      ),
+    [
+      isGlossaryType,
+      glossaryAnchorSlot,
+      isEditTags,
+      multiSelect,
+      tags,
+      handleGlossaryTermsChange,
+      handleExternalControl,
+    ]
+  );
+
+  const addTagButton = useMemo(
+    () =>
+      showAddTagButton ? (
+        <WidgetPlusButton
+          data-testid="add-tag"
+          title={t('label.add-entity', {
+            entity: isGlossaryType
+              ? t('label.glossary-term')
+              : t('label.tag-plural'),
+          })}
+          onClick={handleAddClick}
+        />
+      ) : null,
+    [showAddTagButton, handleAddClick, t, isGlossaryType]
+  );
+
+  const renderTags = useMemo(
+    () =>
+      isEmpty(tags?.[tagType]) && !showNoDataPlaceholder ? null : (
+        <TagsViewer
+          displayType={displayType}
+          entityFqn={columnData?.fqn ?? ''}
+          showNoDataPlaceholder={showNoDataPlaceholder}
+          sizeCap={sizeCap}
+          tagType={tagType}
+          tags={tags?.[tagType] ?? []}
+        />
+      ),
+    [
+      displayType,
+      showNoDataPlaceholder,
+      tags?.[tagType],
+      layoutType,
+      columnData?.fqn,
+    ]
+  );
+
+  const tagsSelectContainer = useMemo(() => {
+    return (
+      <TagSelectForm
+        defaultValue={selectedTagsInternal ?? []}
+        fetchApi={fetchAPI}
+        placeholder={getTagPlaceholder(isGlossaryType)}
+        tagData={initialOptions}
+        onCancel={handleCancel}
+        onSubmit={handleSave}
+      />
+    );
+  }, [
+    isGlossaryType,
+    selectedTagsInternal,
+    getTagPlaceholder,
+    fetchAPI,
+    handleCancel,
+    handleSave,
+    initialOptions,
+  ]);
+
+  const handleTagsTask = (hasTags: boolean) => {
+    navigate(
+      (hasTags ? getUpdateTagsPath : getRequestTagsPath)(
+        entityType as string,
+        entityFqn as string
+      )
+    );
+  };
+
+  const requestTagElement = useMemo(() => {
+    const hasTags = !isEmpty(tags?.[tagType]);
+
+    return (
+      <WidgetRequestButton
+        data-testid="request-entity-tags"
+        title={
+          hasTags
+            ? t('label.update-request-tag-plural')
+            : t('label.request-tag-plural')
+        }
+        onClick={() => handleTagsTask(hasTags)}
+      />
+    );
+  }, [tags?.[tagType], handleTagsTask]);
+
+  const conversationThreadElement = useMemo(
+    () => (
+      <WidgetCommentButton
+        data-testid="tag-thread"
+        title={t('label.list-entity', {
+          entity: t('label.conversation'),
+        })}
+        onClick={() =>
+          onThreadLinkSelect?.(getEntityFeedLink(entityType, entityFqn, 'tags'))
+        }
+      />
+    ),
+    [entityType, entityFqn, onThreadLinkSelect]
+  );
+
+  const headerExtra = useMemo(() => {
+    if (!permission) {
+      return null;
+    }
+
+    return (
+      <Box align="center" gap={2}>
+        {withGlossaryPopover(
+          addTagButton ?? (
+            <WidgetEditButton
+              data-testid="edit-button"
+              title={t('label.edit-entity', {
+                entity:
+                  tagType === TagSource.Classification
+                    ? t('label.tag-plural')
+                    : t('label.glossary-term'),
+              })}
+              onClick={handleAddClick}
+            />
+          ),
+          'header'
+        )}
+        {showTaskHandler && (
+          <>
+            {tagType === TagSource.Classification && requestTagElement}
+            {conversationThreadElement}
+          </>
+        )}
+      </Box>
+    );
+  }, [
+    tags,
+    tagType,
+    isEditTags,
+    permission,
+    showTaskHandler,
+    requestTagElement,
+    conversationThreadElement,
+    withGlossaryPopover,
+    addTagButton,
+  ]);
+
+  const editTagButton = useMemo(
+    () =>
+      permission && !isEmpty(tags?.[tagType]) ? (
+        <EditIconButton
+          className="hover-cell-icon"
+          data-testid="edit-button"
+          newLook={newLook}
+          size="small"
+          title={t('label.edit-entity', {
+            entity:
+              tagType === TagSource.Classification
+                ? t('label.tag-plural')
+                : t('label.glossary-term'),
+          })}
+          onClick={handleAddClick}
+        />
+      ) : null,
+    [permission, tags, tagType, handleAddClick, newLook]
+  );
+
+  const horizontalLayout = useMemo(() => {
+    return (
+      <Box align="center" gap={2}>
+        {withGlossaryPopover(addTagButton, 'body')}
+        <TagsViewer
+          displayType={displayType}
+          entityFqn={columnData?.fqn ?? ''}
+          showNoDataPlaceholder={showNoDataPlaceholder}
+          sizeCap={sizeCap}
+          tags={tags?.[tagType] ?? []}
+        />
+        {showInlineEditButton
+          ? withGlossaryPopover(editTagButton, 'body')
+          : null}
+      </Box>
+    );
+  }, [
+    addTagButton,
+    editTagButton,
+    withGlossaryPopover,
+    displayType,
+    layoutType,
+    showNoDataPlaceholder,
+    tags?.[tagType],
+    showInlineEditButton,
+    columnData?.fqn,
+  ]);
+
+  const tagBody = useMemo(() => {
+    // Glossary edits in the popover, so the body keeps showing the terms.
+    if (isEditTags && !isGlossaryType) {
+      return tagsSelectContainer;
+    }
+
+    if (isHoriZontalLayout) {
+      return horizontalLayout;
+    }
+
+    const shouldShowVerticalLayout =
+      showInlineEditButton || !isEmpty(renderTags) || !newLook;
+
+    if (!shouldShowVerticalLayout) {
+      return null;
+    }
+
+    return (
+      <Box align="center" data-testid="entity-tags" gap={2} wrap="wrap">
+        {addTagButton && (
+          <div className="m-t-xss">
+            {withGlossaryPopover(addTagButton, 'body')}
+          </div>
+        )}
+        {renderTags}
+        {showInlineEditButton ? (
+          <div>{withGlossaryPopover(editTagButton, 'body')}</div>
+        ) : null}
+      </Box>
+    );
+  }, [
+    isEditTags,
+    isGlossaryType,
+    tagsSelectContainer,
+    addTagButton,
+    isHoriZontalLayout,
+    horizontalLayout,
+    renderTags,
+    editTagButton,
+    withGlossaryPopover,
+    showInlineEditButton,
+  ]);
+
+  const suggestionDataRender = useMemo(() => {
+    if (!isGlossaryType && entityType === EntityType.TABLE) {
+      const entityLink = EntityLink.getTableEntityLink(
+        entityFqn ?? '',
+        EntityLink.getTableColumnNameFromColumnFqn(columnData?.fqn ?? '', false)
+      );
+
+      const activeSuggestion = selectedUserSuggestions?.tags.find(
+        (suggestion) =>
+          suggestion.entityLink === entityLink &&
+          !getTierTags(suggestion.tagLabels ?? [])
+      );
+
+      if (activeSuggestion) {
+        return (
+          <SuggestionsAlert
+            hasEditAccess={permission}
+            showSuggestedBy={!entityLink.includes('columns')}
+            suggestion={activeSuggestion}
+          />
+        );
+      }
+    }
+
+    return null;
+  }, [permission, entityType, isGlossaryType, selectedUserSuggestions]);
+
+  const renderNewLookCard = () => (
+    <WidgetCard
+      dataTestId={isGlossaryType ? 'glossary-container' : 'tags-container'}
+      forceExpand={isEditTags}
+      headerExtra={headerExtra}
+      isExpandDisabled={isEmpty(tags?.[tagType]) && !isEditTags}
+      title={isGlossaryType ? t('label.glossary-term') : t('label.tag-plural')}>
+      {/* Since WidgetCard is another component without onClick, wrapping the content in a
+          div to stop propagation */}
+      <div
+        role="presentation"
+        onClick={(e) => {
+          e.stopPropagation();
+        }}>
+        {suggestionDataRender ?? tagBody}
+      </div>
+    </WidgetCard>
+  );
+
+  if (newLook) {
+    return renderNewLookCard();
+  }
+
+  return (
+    <div
+      className="w-full tags-container"
+      data-testid={isGlossaryType ? 'glossary-container' : 'tags-container'}
+      // Narrowed from an unconditional stopPropagation: the tag links and the add/edit buttons
+      // still keep their clicks to themselves, but the padding and the gaps between chips no
+      // longer swallow them. On a clickable row or card those dead spots made the whole tags
+      // column look unclickable.
+      role="presentation"
+      onClick={stopPropagationIfInteractive}>
+      {suggestionDataRender ?? (
+        <>
+          {tagBody}
+          {(children || showBottomEditButton) && (
+            <div className="m-t-xs w-full d-flex items-baseline">
+              {showBottomEditButton && !showInlineEditButton && (
+                <p className="d-flex m-r-md">
+                  {withGlossaryPopover(editTagButton, 'body')}
+                </p>
+              )}
+              {children}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
+
+export default TagsContainerV2;

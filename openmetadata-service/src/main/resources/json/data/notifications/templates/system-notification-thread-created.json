@@ -1,0 +1,9 @@
+{
+  "name": "system-notification-thread-created",
+  "fullyQualifiedName": "system-notification-thread-created",
+  "displayName": "Conversation Created Notification",
+  "description": "System default template for new Conversation V2 notifications",
+  "provider": "system",
+  "templateSubject": "[{{publisherName}}] - Change Event Update from {{emailingEntity}}",
+  "templateBody": "<strong>@{{#if entity.createdBy.displayName}}{{entity.createdBy.displayName}}{{else}}{{entity.createdBy.name}}{{/if}}</strong> started a conversation {{#with (parseEntityLink entity.about) as |link|}}{{#if link.field}}about <strong>{{link.field}}</strong> {{/if}}{{/with}}for <strong>{{camelCaseToTitle entity.entityRef.type}}</strong> <a href=\"{{buildEntityUrl entity.entityRef.type entity.entityRef.fullyQualifiedName}}\">{{#if entity.entityRef.displayName}}{{entity.entityRef.displayName}}{{else}}{{entity.entityRef.fullyQualifiedName}}{{/if}}</a><br><br><strong>💬 Message:</strong><br><blockquote>{{{processMentions entity.message}}}</blockquote>"
+}

@@ -1,0 +1,9 @@
+{
+  "$id": "https://open-metadata.org/schema/entity/column/dashboardDataModelColumn.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Dashboard Data Model Column Type",
+  "$comment": "@om-entity-type",
+  "description": "This schema defines the type for dashboard data model column context to support custom properties extension.",
+  "type": "object",
+  "properties": {}
+}

@@ -1,0 +1,16 @@
+{
+  "$id": "https://open-metadata.org/schema/entity/configuration/openMetadataBaseUrlConfiguration.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpenMetadataBaseUrlConfiguration",
+  "description": "This schema defines the OpenMetadata base URL configuration",
+  "type": "object",
+  "javaType": "org.openmetadata.schema.api.configuration.OpenMetadataBaseUrlConfiguration",
+  "properties": {
+    "openMetadataUrl": {
+      "description": "OpenMetadata Server Endpoint",
+      "type": "string",
+      "default": "http://localhost:8585"
+    }
+  },
+  "additionalProperties": false
+}

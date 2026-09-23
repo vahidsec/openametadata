@@ -1,0 +1,21 @@
+{
+  "$id": "https://open-metadata.org/schema/system/ui/knowledgePanel.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Team",
+  "description": "This schema defines the KnowledgePanel entity. A Knowledge panel is an information box used for UX customization in OpenMetadata.",
+  "type": "object",
+  "javaType": "org.openmetadata.schema.system.ui.KnowledgePanel",
+  "properties": {
+    "entityType": {
+      "description": "Entity Type.",
+      "enum": ["KnowledgePanel"],
+      "default": "KnowledgePanel"
+    },
+    "configuration": {
+      "description": "Configuration for the Knowledge Panel.",
+      "type": "object"
+    }
+  },
+  "required": ["entityType"],
+  "additionalProperties": false
+}

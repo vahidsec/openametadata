@@ -1,0 +1,541 @@
+/*
+ *  Copyright 2024 Collate.
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+import type { Graph } from '@antv/g6';
+import {
+  Category,
+  Characteristic,
+  PaletteKey,
+  RelationshipType,
+} from '../../generated/entity/data/relationshipType';
+
+/** Synthetic id for the glossary/relation "All" option in ontology filter autocompletes */
+export const ONTOLOGY_AUTOCOMPLETE_ALL_ID = '__all__';
+
+/** Max parallel `getGlossaryTermsAssetCounts` calls when multiple glossaries are selected */
+export const GLOSSARY_TERM_ASSET_COUNT_FETCH_CONCURRENCY = 4;
+
+export const withoutOntologyAutocompleteAll = (ids: string[]): string[] =>
+  ids.filter((id) => id !== ONTOLOGY_AUTOCOMPLETE_ALL_ID);
+
+export const DEFAULT_RELATIONSHIP_TYPE: RelationshipType = {
+  id: '00000000-0000-0000-0000-000000000001',
+  name: 'relatedTo',
+  fullyQualifiedName: 'relatedTo',
+  displayName: 'Related To',
+  description: 'General associative relationship',
+  rdfPredicate: 'https://open-metadata.org/ontology/relatedTo',
+  category: Category.Core,
+  characteristics: [Characteristic.Symmetric],
+  crossGlossaryAllowed: true,
+  paletteKey: PaletteKey.Blue,
+  systemDefined: true,
+};
+
+export const DEFAULT_GLOSSARY_TERM_RELATION_TYPES_FALLBACK = [
+  DEFAULT_RELATIONSHIP_TYPE,
+];
+
+export const RELATION_META: Record<
+  string,
+  { color: string; background: string; labelKey: string }
+> = {
+  relatedTo: {
+    color: '#1570ef',
+    background: '#eff8ff',
+    labelKey: 'label.related-to',
+  },
+  related: {
+    color: '#1570ef',
+    background: '#eff8ff',
+    labelKey: 'label.related',
+  },
+  synonym: {
+    color: '#b42318',
+    background: '#fef3f2',
+    labelKey: 'label.synonym',
+  },
+  antonym: {
+    color: '#b54708',
+    background: '#fffaeb',
+    labelKey: 'label.antonym',
+  },
+  typeOf: {
+    color: '#067647',
+    background: '#ecfdf3',
+    labelKey: 'label.type-of',
+  },
+  hasTypes: {
+    color: '#067647',
+    background: '#ecfdf3',
+    labelKey: 'label.has-types',
+  },
+  hasA: {
+    color: '#026aa2',
+    background: '#f0f9ff',
+    labelKey: 'label.has-a',
+  },
+  partOf: {
+    color: '#026aa2',
+    background: '#f0f9ff',
+    labelKey: 'label.part-of',
+  },
+  hasPart: {
+    color: '#155eef',
+    background: '#eff4ff',
+    labelKey: 'label.has-part',
+  },
+  componentOf: {
+    color: '#026aa2',
+    background: '#f0f9ff',
+    labelKey: 'label.component-of',
+  },
+  composedOf: {
+    color: '#026aa2',
+    background: '#f0f9ff',
+    labelKey: 'label.composed-of',
+  },
+  calculatedFrom: {
+    color: '#6938ef',
+    background: '#f4f3ff',
+    labelKey: 'label.calculated-from',
+  },
+  usedToCalculate: {
+    color: '#ba24d5',
+    background: '#fdf4ff',
+    labelKey: 'label.used-to-calculate',
+  },
+  derivedFrom: {
+    color: '#bc1b06',
+    background: '#fff4ed',
+    labelKey: 'label.derived-from',
+  },
+  seeAlso: {
+    color: '#c11574',
+    background: '#fdf2fa',
+    labelKey: 'label.see-also',
+  },
+  parentOf: {
+    color: '#1570ef',
+    background: '#eff8ff',
+    labelKey: 'label.parent-of',
+  },
+  childOf: {
+    color: '#1570ef',
+    background: '#eff8ff',
+    labelKey: 'label.child-of',
+  },
+  broader: {
+    color: '#067647',
+    background: '#ecfdf3',
+    labelKey: 'label.broader',
+  },
+  narrower: {
+    color: '#4e5ba6',
+    background: '#f8f9fc',
+    labelKey: 'label.narrower',
+  },
+  isA: {
+    color: '#067647',
+    background: '#ecfdf3',
+    labelKey: 'label.is-a',
+  },
+  instanceOf: {
+    color: '#067647',
+    background: '#ecfdf3',
+    labelKey: 'label.instance-of',
+  },
+  owns: {
+    color: '#6938ef',
+    background: '#f4f3ff',
+    labelKey: 'label.owns',
+  },
+  ownedBy: {
+    color: '#6938ef',
+    background: '#f4f3ff',
+    labelKey: 'label.owned-by',
+  },
+  manages: {
+    color: '#1570ef',
+    background: '#eff8ff',
+    labelKey: 'label.manages',
+  },
+  managedBy: {
+    color: '#1570ef',
+    background: '#eff8ff',
+    labelKey: 'label.managed-by',
+  },
+  contains: {
+    color: '#026aa2',
+    background: '#f0f9ff',
+    labelKey: 'label.contains',
+  },
+  containedIn: {
+    color: '#026aa2',
+    background: '#f0f9ff',
+    labelKey: 'label.contained-in',
+  },
+  dependsOn: {
+    color: '#b42318',
+    background: '#fef3f2',
+    labelKey: 'label.depends-on',
+  },
+  usedBy: {
+    color: '#b54708',
+    background: '#fffaeb',
+    labelKey: 'label.used-by',
+  },
+  metricFor: {
+    color: '#026aa2',
+    background: '#f0f9ff',
+    labelKey: 'label.metric-for',
+  },
+  hasGlossaryTerm: {
+    color: '#107569',
+    background: '#f0fdf9',
+    labelKey: 'label.tagged-with',
+  },
+  custom1: {
+    color: '#bc1b06',
+    background: '#fff4ed',
+    labelKey: 'label.color-orange',
+  },
+  custom2: {
+    color: '#535862',
+    background: '#fafafa',
+    labelKey: 'label.color-gray',
+  },
+  custom6: {
+    color: '#107569',
+    background: '#f0fdf9',
+    labelKey: 'label.color-rose',
+  },
+  custom4: {
+    color: '#7839ee',
+    background: '#f5f3ff',
+    labelKey: 'label.color-teal',
+  },
+  custom5: {
+    color: '#4f7a21',
+    background: '#f5fbee',
+    labelKey: 'label.color-moss',
+  },
+  custom7: {
+    color: '#0e7090',
+    background: '#ecfdff',
+    labelKey: 'label.color-cyan',
+  },
+  custom3: {
+    color: '#e31b54',
+    background: '#fff1f3',
+    labelKey: 'label.color-violet',
+  },
+  default: {
+    color: '#535862',
+    background: '#fafafa',
+    labelKey: 'label.relation-type',
+  },
+};
+
+export const RELATION_COLORS: Record<string, string> = Object.fromEntries(
+  Object.entries(RELATION_META).map(([key, { color }]) => [key, color])
+);
+
+export const COLOR_META_BY_HEX: Record<
+  string,
+  { color: string; background: string; labelKey: string }
+> = {
+  '#1570ef': {
+    color: '#1570ef',
+    background: '#eff8ff',
+    labelKey: 'label.color-blue',
+  },
+  '#b42318': {
+    color: '#b42318',
+    background: '#fef3f2',
+    labelKey: 'label.color-red',
+  },
+  '#b54708': {
+    color: '#b54708',
+    background: '#fffaeb',
+    labelKey: 'label.color-yellow',
+  },
+  '#067647': {
+    color: '#067647',
+    background: '#ecfdf3',
+    labelKey: 'label.color-green',
+  },
+  '#4e5ba6': {
+    color: '#4e5ba6',
+    background: '#f8f9fc',
+    labelKey: 'label.color-blue-gray',
+  },
+  '#026aa2': {
+    color: '#026aa2',
+    background: '#f0f9ff',
+    labelKey: 'label.color-blue-light',
+  },
+  '#155eef': {
+    color: '#155eef',
+    background: '#eff4ff',
+    labelKey: 'label.color-dark-blue',
+  },
+  '#6938ef': {
+    color: '#6938ef',
+    background: '#f4f3ff',
+    labelKey: 'label.color-purple',
+  },
+  '#ba24d5': {
+    color: '#ba24d5',
+    background: '#fdf4ff',
+    labelKey: 'label.color-fuchsia',
+  },
+  '#c11574': {
+    color: '#c11574',
+    background: '#fdf2fa',
+    labelKey: 'label.color-pink',
+  },
+  '#bc1b06': {
+    color: '#bc1b06',
+    background: '#fff4ed',
+    labelKey: 'label.color-orange',
+  },
+  '#107569': {
+    color: '#107569',
+    background: '#f0fdf9',
+    labelKey: 'label.color-rose',
+  },
+  '#535862': {
+    color: '#535862',
+    background: '#fafafa',
+    labelKey: 'label.color-gray',
+  },
+  '#e31b54': {
+    color: '#e31b54',
+    background: '#fff1f3',
+    labelKey: 'label.color-violet',
+  },
+  '#7839ee': {
+    color: '#7839ee',
+    background: '#f5f3ff',
+    labelKey: 'label.color-teal',
+  },
+  '#4f7a21': {
+    color: '#4f7a21',
+    background: '#f5fbee',
+    labelKey: 'label.color-moss',
+  },
+  '#0e7090': {
+    color: '#0e7090',
+    background: '#ecfdff',
+    labelKey: 'label.color-cyan',
+  },
+};
+
+const BORDER_SECONDARY_TOKEN = 'var(--color-border-secondary)';
+
+export const EDGE_STROKE_COLOR = 'var(--color-border-primary)';
+export const DATA_MODE_ASSET_EDGE_STROKE_COLOR = BORDER_SECONDARY_TOKEN;
+export const DIMMED_NODE_OPACITY = 0.32;
+export const DIMMED_EDGE_OPACITY = 0.12;
+export const DIMMED_EDGE_LABEL_OPACITY = 0.16;
+
+export const NODE_FILL_DEFAULT = 'var(--color-bg-primary)';
+export const NODE_BORDER_COLOR = BORDER_SECONDARY_TOKEN;
+export const NODE_SELECTED_STROKE = 'var(--color-border-brand)';
+export const NODE_SELECTED_LINE_WIDTH = 2.5;
+export const NODE_SELECTED_HALO_LINE_WIDTH = 4;
+export const NODE_SELECTED_HALO_FILL = 'var(--color-bg-brand-primary)';
+export const NODE_BORDER_RADIUS = 9;
+export const NODE_PADDING_V = 9;
+export const NODE_PADDING_H = 12;
+/** Node label padding [top, right, bottom, left] – 12px top/bottom, 6px left/right. */
+export const NODE_LABEL_PADDING: [number, number, number, number] = [
+  NODE_PADDING_V,
+  NODE_PADDING_H,
+  NODE_PADDING_V,
+  NODE_PADDING_H,
+];
+export const COMBO_FILL_DEFAULT = NODE_FILL_DEFAULT;
+export const COMBO_BODY_FILL_OPACITY = '22';
+export const COMBO_LABEL_BG_OPACITY = '40';
+export const NODE_LABEL_FILL = 'var(--color-text-primary)';
+export const NODE_LABEL_FILL_INVERSE = 'var(--color-text-white)';
+export const BRAND_BLUE_FALLBACK = '#3b82f6';
+export const COMBO_COLOR_FALLBACK = '#94a3b8';
+export const DATA_MODE_ASSET_COUNT_BADGE_BG = 'var(--color-bg-primary-solid)';
+export const DATA_MODE_LOAD_MORE_BADGE_BG = 'var(--color-bg-brand-solid)';
+export const NODE_LABEL_FONT_SIZE = 11;
+export const NODE_LABEL_FONT_WEIGHT = 600;
+export const NODE_SHADOW_COLOR = BORDER_SECONDARY_TOKEN;
+export const NODE_SHADOW_BLUR = 2;
+export const NODE_SHADOW_OFFSET_Y = 1;
+
+export const EDGE_LABEL_FILL = 'var(--color-text-tertiary)';
+export const EDGE_LABEL_FONT_SIZE = 10;
+export const EDGE_LABEL_FONT_WEIGHT = 600;
+export const EDGE_LABEL_FONT_FAMILY = 'Inter';
+export const EDGE_LABEL_LINE_HEIGHT = 16;
+export const EDGE_LABEL_LETTER_SPACING = 0;
+export const EDGE_LABEL_BG_FILL = 'var(--color-bg-secondary)';
+export const EDGE_LABEL_BG_STROKE = NODE_FILL_DEFAULT;
+export const EDGE_LABEL_BG_RADIUS = 3;
+export const EDGE_LABEL_BG_SHADOW_COLOR = BORDER_SECONDARY_TOKEN;
+export const EDGE_LABEL_BG_SHADOW_BLUR = 10;
+export const EDGE_LABEL_BG_SHADOW_OFFSET_Y = 2;
+export const EDGE_LABEL_BG_PADDING: [number, number, number, number] = [
+  2, 8, 2, 8,
+];
+export const TERM_LABEL_BG_PADDING: [number, number, number, number] = [
+  8, 8, 8, 8,
+];
+
+export const MIN_ZOOM = 0.001;
+export const MAX_ZOOM = 3;
+export const DEFAULT_ZOOM = 1;
+export const FIT_VIEW_ZOOM_OUT = 0.95;
+export const FIT_VIEW_ZOOM_OUT_DATA_MODE = 0.85;
+export const ONTOLOGY_FIT_VIEW_PADDING = 40;
+export const ONTOLOGY_LARGE_GRAPH_NODE_COUNT = 1500;
+export const ONTOLOGY_TERMS_PAGE_SIZE = 300;
+export const ONTOLOGY_HEALTH_PREVIEW_SIZE = 5;
+export const DATA_MODE_MAX_RENDER_COUNT = 60;
+export const DATA_MODE_SEED_PAGE_SIZE = 12;
+export const DATA_MODE_ASSET_PREVIEW_SIZE = 4;
+export const DATA_MODE_CONNECTED_TERM_LIMIT = 48;
+export const DATA_MODE_EDGE_LIMIT = 100;
+export const DATA_MODE_LINEAGE_EDGE_LIMIT = 100;
+export const PRACTICAL_MIN_ZOOM = 0.15;
+export const PRACTICAL_MAX_ZOOM_INITIAL = 1;
+
+export async function fitViewWithMinZoom(
+  graph: Graph,
+  duration = 0
+): Promise<void> {
+  await graph.fitView({ when: 'always', direction: 'both' }, { duration });
+  const zoom = graph.getZoom();
+  if (zoom > PRACTICAL_MAX_ZOOM_INITIAL) {
+    graph.zoomTo(
+      PRACTICAL_MAX_ZOOM_INITIAL,
+      { duration: 0 },
+      graph.getCanvasCenter()
+    );
+  }
+}
+
+export const DATA_MODE_ASSET_LOAD_PAGE_SIZE = 6;
+/** Max assets a single "Load more" click pulls into a card (matches the backend @Max). */
+export const DATA_MODE_ASSET_MAX_LOAD = 100;
+export const DATA_MODE_ASSET_CIRCLE_SIZE = 20;
+
+export const DATA_MODE_ASSET_LABEL_FONT_SIZE = 12;
+export const DATA_MODE_ASSET_LABEL_BOX_MIN_WIDTH = 0;
+export const DATA_MODE_ASSET_NAME_MAX_TEXT_WIDTH_PX = 220;
+export const DATA_MODE_ASSET_ROW_MAX_WIDTH = 720;
+export const DATA_MODE_ENTITY_TYPE_PILL_MAX_TEXT_WIDTH_PX = 200;
+export const DATA_MODE_ASSET_LABEL_BOX_RADIUS = 4;
+export const DATA_MODE_ASSET_LABEL_BOX_PADDING: [
+  number,
+  number,
+  number,
+  number
+] = [6, 10, 6, 10];
+export const DATA_MODE_ASSET_LABEL_LAYOUT_STACK = 62;
+export const DATA_MODE_TERM_TO_FIRST_RING_GAP = 120;
+export const COMBO_HEADER_HEIGHT = 34;
+export const COMBO_INTERIOR_PADDING_TOP = COMBO_HEADER_HEIGHT + 10;
+export const COMBO_INTERIOR_PADDING_SIDES = 12;
+export const COMBO_LABEL_PADDING_LEFT = 13;
+export const MODEL_ANTV_DAGRE_RANKSEP_WITH_COMBOS = 100;
+
+export enum LayoutType {
+  Hierarchical = 'hierarchical',
+  Circular = 'circular',
+}
+
+export enum LayoutEngine {
+  Dagre = 'dagre',
+  Circular = 'circular',
+}
+
+export type LayoutEngineType = `${LayoutEngine}`;
+
+export function toLayoutEngineType(layout: LayoutType): LayoutEngineType {
+  if (layout === LayoutType.Hierarchical) {
+    return LayoutEngine.Dagre;
+  }
+
+  return layout as LayoutEngineType;
+}
+
+export const COMBO_LABEL_PADDING_TOP_BOTTOM = 10;
+export const DATA_MODE_TERM_NODE_SIZE = 30;
+export const DATA_MODE_TERM_H_SPACING = 480;
+export const DATA_MODE_TERM_V_SPACING = 160;
+export const DATA_MODE_TERM_NODE_STROKE_WIDTH = 2;
+/** Keep the term halo aligned with the active theme's elevated borders. */
+export const DATA_MODE_TERM_HALO_LINE_WIDTH = 5;
+export const DATA_MODE_TERM_HALO_STROKE = BORDER_SECONDARY_TOKEN;
+export const DATA_MODE_TERM_HALO_STROKE_OPACITY = 0.72;
+export const DATA_MODE_TERM_HALO_SHADOW_COLOR = BORDER_SECONDARY_TOKEN;
+export const DATA_MODE_TERM_HALO_SHADOW_BLUR = 5;
+export const DATA_MODE_TERM_NODE_SHADOW_COLOR = 'var(--color-border-primary)';
+export const DATA_MODE_TERM_NODE_SHADOW_BLUR = 16;
+export const DATA_MODE_TERM_NODE_SHADOW_OFFSET_Y = 5;
+export const DATA_MODE_TERM_LABEL_SHADOW_COLOR = BORDER_SECONDARY_TOKEN;
+export const DATA_MODE_TERM_LABEL_SHADOW_BLUR = 14;
+export const DATA_MODE_TERM_LABEL_SHADOW_OFFSET_Y = 4;
+export const NODE_BADGE_OFFSET_X = 8;
+export const NODE_BADGE_OFFSET_Y = -8;
+export const DATA_MODE_TERM_ASSET_COUNT_BADGE_PADDING: [
+  number,
+  number,
+  number,
+  number
+] = [5, 7, 5, 7];
+export const DATA_MODE_TERM_ASSET_COUNT_BADGE_DIAMETER = 24;
+export const DATA_MODE_TERM_ASSET_COUNT_BADGE_DIAMETER_WIDE = 28;
+export const DATA_MODE_TERM_ASSET_COUNT_BADGE_WIDTH_CHAR = 7;
+export const DATA_MODE_TERM_ASSET_COUNT_BADGE_WIDTH_MIN = 12;
+export const HIERARCHY_BADGE_OFFSET_X = 0;
+export const HIERARCHY_BADGE_OFFSET_Y = -18;
+export const HIERARCHY_BADGE_TEXT_INSET = 16;
+
+export const NODE_LINE_WIDTH = 1.5;
+export const DATA_MODE_ASSET_LINE_WIDTH = 1.5;
+export const DATA_MODE_LABEL_OFFSET_Y = 20;
+export const DATA_MODE_TERM_LABEL_BG_RADIUS = 6;
+export const DATA_MODE_TERM_LABEL_FONT_WEIGHT = 600;
+export const DATA_MODE_ASSET_LABEL_FONT_WEIGHT = 500;
+export const DATA_MODE_ASSET_NAME_ENTITY_GAP = 20;
+export const DATA_MODE_ENTITY_PILL_ICON_SIZE = 14;
+export const DATA_MODE_ENTITY_PILL_ICON_PAD_LEFT = 6;
+export const DATA_MODE_ENTITY_PILL_ICON_GAP_AFTER = 1;
+export const DATA_MODE_ASSET_CARD_INSET_H = 8;
+export const DATA_MODE_ASSET_CARD_CLEAR_BELOW_CIRCLE = 20;
+export const DATA_MODE_ASSET_BADGE_Z_INDEX = -1;
+export const DATA_MODE_ENTITY_BADGE_BORDER_FALLBACK = '#D5D7DA';
+export const DATA_MODE_ENTITY_BADGE_FONT_SIZE = 10;
+export const DATA_MODE_ENTITY_BADGE_VERTICAL_NUDGE_UP = 6;
+export const DATA_MODE_ENTITY_PILL_ICON_NUDGE_UP = 7;
+export const DATA_MODE_ENTITY_PILL_TRIM_RIGHT_PX = 0;
+export const COMBO_LINE_WIDTH = 0.8;
+export const COMBO_RADIUS = 10;
+export const COMBO_LABEL_FONT_SIZE = 12;
+export const COMBO_LABEL_FONT_WEIGHT = 600;
+export const EDGE_LINE_APPEND_WIDTH = 12;
+export const EDGE_LINE_WIDTH_DEFAULT = 1.5;
+export const EDGE_LINE_WIDTH_HIGHLIGHTED = 2.5;
+export const NODE_LABEL_FILL_FALLBACK = '#1e293b';
+export const NODE_SHADOW_COLOR_FALLBACK = 'rgba(0,0,0,0.12)';
+export const LABEL_TEXT_ALIGN_LEFT = 'left';

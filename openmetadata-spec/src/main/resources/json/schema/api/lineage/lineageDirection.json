@@ -1,0 +1,9 @@
+{
+  "$id": "https://open-metadata.org/schema/api/lineage/lineageDirection.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LineageDirection",
+  "description": "Lineage Direction Schema.",
+  "javaType": "org.openmetadata.schema.api.lineage.LineageDirection",
+  "type": "string",
+  "enum": ["Upstream", "Downstream"]
+}

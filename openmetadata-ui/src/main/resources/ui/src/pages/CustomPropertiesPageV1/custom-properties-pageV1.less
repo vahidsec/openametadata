@@ -1,0 +1,32 @@
+/*
+ *  Copyright 2022 Collate.
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ */
+
+@import (reference) '../../styles/variables.less';
+
+.custom-properties-schemaEditor {
+  border: 1px solid @border-color;
+  border-radius: @border-rad-sm;
+  overflow: hidden;
+}
+
+// The custom-properties table renders on TableV2 with a fixed horizontal
+// extent (scroll.x), so when the settings content is narrower than that extent
+// the table shows a horizontal scrollbar. Its height nudges the page's vertical
+// scrollbar on; the vertical scrollbar's width then narrows the content and
+// re-triggers the horizontal overflow — the two toggle each other and the table
+// visibly flickers. Reserving the vertical scrollbar's gutter keeps the content
+// width constant, so the horizontal overflow no longer oscillates. Scoped via
+// :has() to this page's scroller only, to avoid shifting other pages' layout.
+.page-layout-v1-vertical-scroll:has(.entity-custom-properties-table) {
+  scrollbar-gutter: stable;
+}

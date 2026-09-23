@@ -1,0 +1,15 @@
+{
+  "$id": "https://open-metadata.org/schema/api/feed/createPost.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CreatePostRequest",
+  "description": "Request to create a reply.",
+  "type": "object",
+  "properties": {
+    "message": {
+      "description": "Reply in Markdown format. See markdown support for more details.",
+      "$ref": "../../type/basic.json#/definitions/nonBlankMarkdown"
+    }
+  },
+  "required": ["message"],
+  "additionalProperties": false
+}
