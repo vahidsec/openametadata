@@ -170,7 +170,7 @@ jobs:
       # it buys nothing. The resolver reports its own outcome onto this PR.
       - name: Hand the backport to the resolver
         id: dispatch
-        uses: benc-uk/workflow-dispatch@v1.3.2
+        uses: benc-uk/workflow-dispatch@v1.3.3
         with:
           # By filename, not display name. This was `Resolve an OpenMetadata
           # backport conflict` and broke the moment that workflow was renamed —
