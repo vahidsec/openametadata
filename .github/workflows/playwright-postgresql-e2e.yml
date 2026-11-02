@@ -150,7 +150,7 @@ jobs:
       - name: Download blob reports
         id: download-blobs
         if: ${{ always() && needs.playwright.outputs.playwright_ci_result != 'skipped' }}
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           pattern: playwright-blob-*
@@ -160,7 +160,7 @@ jobs:
       - name: Download timing metrics
         id: download-timings
         if: ${{ always() && needs.playwright.outputs.playwright_ci_result != 'skipped' }}
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           pattern: playwright-timings-*
@@ -170,7 +170,7 @@ jobs:
         id: download-plans
         if: ${{ always() && needs.playwright.outputs.playwright_ci_result != 'skipped' }}
         continue-on-error: true
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: playwright-shard-plans
           path: ${{ runner.temp }}/playwright-plans
@@ -178,7 +178,7 @@ jobs:
       - name: Download all results JSON
         id: download-results
         if: ${{ always() && needs.playwright.outputs.playwright_ci_result != 'skipped' }}
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         continue-on-error: true
         with:
           # Restrict the glob to the current workflow attempt so a re-run
@@ -617,7 +617,7 @@ jobs:
           token: ${{ secrets.RELEASE_BOT_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Download timing history artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: playwright-timing-history-full-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/timing-history

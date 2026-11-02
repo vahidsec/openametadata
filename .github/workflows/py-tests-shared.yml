@@ -226,7 +226,7 @@ jobs:
           install-server: 'false'
 
       - name: Download spaCy model
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: spacy-en-model
           path: /tmp/spacy-model
@@ -392,7 +392,7 @@ jobs:
 
       # Must precede the setup action, which builds the server image from this tarball.
       - name: Download backend distribution
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: openmetadata-backend-distribution
           path: openmetadata-dist/target
@@ -404,7 +404,7 @@ jobs:
           args: ${{ inputs.compose-args }}
 
       - name: Download spaCy model
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: spacy-en-model
           path: /tmp/spacy-model
@@ -603,7 +603,7 @@ jobs:
         shell: bash
 
       - name: Download coverage artifacts
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: coverage-*
           path: ingestion/coverage-data/
