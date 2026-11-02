@@ -303,7 +303,7 @@ jobs:
           sudo make install_antlr_cli
 
       - name: Download Integration Test Runtime
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: java-it-build-mysql-elasticsearch-${{ github.run_id }}
           path: ${{ runner.temp }}/java-it-build

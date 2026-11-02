@@ -639,7 +639,7 @@ jobs:
           persist-credentials: false
 
       - name: Download selection
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: playwright-selection
           path: ${{ runner.temp }}/playwright-selection
@@ -958,7 +958,7 @@ jobs:
 
       - name: Download OpenMetadata distribution
         if: ${{ needs.restore-playwright-fixture.outputs.fixture_cache_hit != 'true' || (needs.plan-playwright.outputs.requires_airflow == 'true' && needs.restore-playwright-fixture.outputs.ingestion_cache_hit != 'true') }}
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: openmetadata-distribution
           path: openmetadata-dist/target
@@ -1297,14 +1297,14 @@ jobs:
 
       - name: Download OpenMetadata distribution
         id: download-distribution
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: openmetadata-distribution
           path: ${{ runner.temp }}/openmetadata-distribution
 
       - name: Download seeded fixture
         id: download-fixture
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: playwright-seeded-fixture
           path: ${{ runner.temp }}/playwright-fixture
@@ -1312,14 +1312,14 @@ jobs:
       - name: Download ingestion image
         id: download-ingestion-image
         if: ${{ matrix.requiresAirflow }}
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: playwright-ingestion-image
           path: ${{ runner.temp }}/playwright-ingestion-image
 
       - name: Download shard plans
         id: download-plans
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: playwright-shard-plans
           path: ${{ runner.temp }}/playwright-plans
@@ -1937,7 +1937,7 @@ jobs:
           done
 
       - name: Download blob reports
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           pattern: playwright-blob-*
           path: openmetadata-ui/src/main/resources/ui/blob-reports

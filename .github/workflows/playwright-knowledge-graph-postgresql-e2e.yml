@@ -308,7 +308,7 @@ jobs:
         run: mkdir -p "${{ runner.temp }}/openmetadata-distribution"
 
       - name: Download OpenMetadata distribution
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: openmetadata-distribution
           path: ${{ runner.temp }}/openmetadata-distribution
